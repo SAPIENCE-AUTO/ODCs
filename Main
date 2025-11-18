@@ -1,0 +1,28 @@
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from reportlab.pdfgen import canvas
+from io import BytesIO
+
+app = FastAPI()
+
+@app.post("/generate-odc")
+async def generate_odc(payload: dict):
+
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=(595, 842))  # A4
+
+    # ---- Ejemplo simple (luego lo convertimos al layout real) ----
+    pdf.setFont("Helvetica-Bold", 16)
+    pdf.drawString(50, 800, f"ODC #: {payload['odc']['numero']}")
+
+    pdf.setFont("Helvetica", 12)
+    pdf.drawString(50, 780, f"Proveedor: {payload['odc']['proveedor']['nombre']}")
+    pdf.drawString(50, 760, f"Proyecto: {payload['odc']['proveedor']['proyecto']}")
+
+    # Aquí después vendrá TODA tu maquetación final (header, tabla, totales…)
+
+    pdf.showPage()
+    pdf.save()
+    buffer.seek(0)
+
+    return StreamingResponse(buffer, media_type="application/pdf")

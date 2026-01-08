@@ -1,19 +1,16 @@
-from __future__ import annotations
-
-import io
 import os
-from datetime import date, datetime
-from pathlib import Path
-from typing import List, Optional
+from io import BytesIO
+from datetime import datetime
 
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from typing import List, Optional
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
-from reportlab.pdfgen import canvas as rl_canvas
+from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.utils import ImageReader
@@ -24,373 +21,358 @@ from reportlab.lib.utils import ImageReader
 # -----------------------------
 app = FastAPI(title="ODCs Generator", version="1.0.0")
 
-BASE_DIR = Path(__file__).resolve().parent
-ASSETS_DIR = BASE_DIR / "assets"
+
+# -----------------------------
+# Paths / Assets
+# -----------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+
+LOGO_PATH = os.path.join(ASSETS_DIR, "logo_sapience_blanco.png")
+FONTS_DIR = os.path.join(ASSETS_DIR, "fonts")
+
+FONT_REGULAR = os.path.join(FONTS_DIR, "Montserrat-Regular.ttf")
+FONT_SEMIBOLD = os.path.join(FONTS_DIR, "Montserrat-SemiBold.ttf")
+FONT_BOLD = os.path.join(FONTS_DIR, "Montserrat-Bold.ttf")
+
+
+def _register_fonts():
+    """
+    Register Montserrat fonts if present; otherwise fallback to Helvetica.
+    """
+    try:
+        if os.path.exists(FONT_REGULAR):
+            pdfmetrics.registerFont(TTFont("Montserrat", FONT_REGULAR))
+        if os.path.exists(FONT_SEMIBOLD):
+            pdfmetrics.registerFont(TTFont("Montserrat-SemiBold", FONT_SEMIBOLD))
+        if os.path.exists(FONT_BOLD):
+            pdfmetrics.registerFont(TTFont("Montserrat-Bold", FONT_BOLD))
+    except Exception:
+        # If something fails, we will fallback silently
+        pass
+
+
+def _font(name: str) -> str:
+    """
+    Safe font selector.
+    """
+    available = set(pdfmetrics.getRegisteredFontNames())
+    if name in available:
+        return name
+    # fallback
+    return "Helvetica"
 
 
 # -----------------------------
-# Models
+# Input schema
 # -----------------------------
-class BillTo(BaseModel):
-    name: str
-    rfc: str
-    address: str
-
-
 class ODCItem(BaseModel):
-    concept: str
-    unit_cost: float = Field(..., ge=0)
-    units: int = Field(..., ge=1)
+    concepto: str
+    costo_unitario: float
+    unidades: int
+
+    @property
+    def subtotal(self) -> float:
+        return float(self.costo_unitario) * int(self.unidades)
 
 
 class ODCRequest(BaseModel):
-    odc_prefix: str = Field(default="RI")
-    odc_number: str = Field(..., description="Ej: 02497")
-    date: Optional[str] = Field(default=None, description="YYYY-MM-DD. Si no, hoy.")
-    provider: str
-    service: str
-    project: str
-    bill_to: BillTo
+    odc_num: str = Field(..., example="RI-02497")
+    fecha: str = Field(..., example="08 ene 2026")  # puedes mandar texto ya formateado
+    proveedor: str = Field(..., example="María Guadalupe Garza Sardaneta")
+    servicio: str = Field(..., example="Reclutamiento")
+    proyecto: str = Field(..., example="ALONG")
+
+    facturar_a_nombre: str = Field(..., example="ASESORES GLOBALES CORPORATIVOS")
+    facturar_a_rfc: str = Field(..., example="AGC051117MX5")
+    facturar_a_direccion: str = Field(..., example="Peregrinos 24, Colinas del Sur,\nÁlvaro Obregón, CP. 01430, CDMX")
+
     items: List[ODCItem]
+
+    mostrar_totales: bool = True
 
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def try_register_montserrat() -> dict:
-    """
-    Tries to register Montserrat fonts if present.
-    Returns a dict with font names to use.
-    """
-    fonts_dir = ASSETS_DIR / "fonts"
-    regular = fonts_dir / "Montserrat-Regular.ttf"
-    bold = fonts_dir / "Montserrat-Bold.ttf"
-    semibold = fonts_dir / "Montserrat-SemiBold.ttf"
-
-    # Defaults (built-in)
-    out = {
-        "regular": "Helvetica",
-        "bold": "Helvetica-Bold",
-        "semibold": "Helvetica-Bold",
-    }
-
-    try:
-        if regular.exists():
-            pdfmetrics.registerFont(TTFont("Montserrat", str(regular)))
-            out["regular"] = "Montserrat"
-        if bold.exists():
-            pdfmetrics.registerFont(TTFont("Montserrat-Bold", str(bold)))
-            out["bold"] = "Montserrat-Bold"
-        if semibold.exists():
-            pdfmetrics.registerFont(TTFont("Montserrat-SemiBold", str(semibold)))
-            out["semibold"] = "Montserrat-SemiBold"
-    except Exception:
-        # If anything goes wrong, just fall back silently
-        pass
-
-    return out
+def money_mx(value: float) -> str:
+    # Formato tipo $4,200
+    return "${:,.0f}".format(value)
 
 
-def money(v: float) -> str:
-    return f"${v:,.2f}"
+def money_mx_2(value: float) -> str:
+    # Formato tipo $1,400.00
+    return "${:,.2f}".format(value)
 
 
-def parse_date(d: Optional[str]) -> date:
-    if not d:
-        return date.today()
-    # Accept YYYY-MM-DD
-    return datetime.strptime(d, "%Y-%m-%d").date()
+def draw_text(c: canvas.Canvas, x, y, text, font_name, font_size, color=colors.black):
+    c.setFillColor(color)
+    c.setFont(font_name, font_size)
+    c.drawString(x, y, text)
 
 
-def draw_wrapped_text(c: rl_canvas.Canvas, text: str, x: float, y: float, max_w: float, font: str, size: int, leading: float):
-    """
-    Basic wrapper: splits by spaces and wraps within max_w.
-    Returns final y after drawing.
-    """
-    c.setFont(font, size)
-    words = (text or "").split()
-    line = ""
-    lines = []
-    for w in words:
-        test = (line + " " + w).strip()
-        if c.stringWidth(test, font, size) <= max_w:
-            line = test
-        else:
-            if line:
-                lines.append(line)
-            line = w
-    if line:
-        lines.append(line)
-
-    for ln in lines:
-        c.drawString(x, y, ln)
-        y -= leading
-    return y
+def draw_text_right(c: canvas.Canvas, x, y, text, font_name, font_size, color=colors.black):
+    c.setFillColor(color)
+    c.setFont(font_name, font_size)
+    c.drawRightString(x, y, text)
 
 
-def get_logo_path() -> Path:
-    # Prefer renamed version, but accept the original name with spaces
-    p1 = ASSETS_DIR / "logo_sapience_blanco.png"
-    p2 = ASSETS_DIR / "logo sapience blanco.png"
-    if p1.exists():
-        return p1
-    return p2
+def draw_text_center(c: canvas.Canvas, x, y, text, font_name, font_size, color=colors.black):
+    c.setFillColor(color)
+    c.setFont(font_name, font_size)
+    c.drawCentredString(x, y, text)
 
 
 # -----------------------------
-# PDF Generator
+# PDF builder
 # -----------------------------
-def generate_odc_pdf(payload: ODCRequest) -> bytes:
-    fonts = try_register_montserrat()
+def build_odc_pdf(payload: ODCRequest) -> bytes:
+    _register_fonts()
 
-    buffer = io.BytesIO()
-    c = rl_canvas.Canvas(buffer, pagesize=A4)
-    w, h = A4
+    W, H = A4
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
 
-    # Brand colors (ajústalos si quieres)
-    NAVY = colors.HexColor("#143647")   # header + table header
-    LIGHT_GREY = colors.HexColor("#EEF2F5")
-    MID_GREY = colors.HexColor("#D9E1E7")
-    TEXT_DARK = colors.HexColor("#0E1A22")
-    ACCENT_RED = colors.HexColor("#E53935")
-    WHITE = colors.white
+    # Colors
+    BLUE = colors.HexColor("#123A4B")
+    LIGHT_GRAY = colors.HexColor("#EFEFEF")
+    LINE_GRAY = colors.HexColor("#8A8A8A")
+    RED = colors.HexColor("#E53935")
+    TEXT = colors.HexColor("#111111")
 
-    # Margins
-    left = 18 * mm
-    right = 18 * mm
-    top = 18 * mm
-    bottom = 18 * mm
-    content_w = w - left - right
+    # Fonts (safe)
+    F_REG = _font("Montserrat")
+    F_SEMI = _font("Montserrat-SemiBold")
+    F_BOLD = _font("Montserrat-Bold")
 
+    # Margins / layout
+    M = 18 * mm
+    header_h = 42 * mm
+
+    # -----------------------------
     # Header bar
-    header_h = 26 * mm
-    c.setFillColor(NAVY)
-    c.rect(0, h - header_h, w, header_h, fill=1, stroke=0)
+    # -----------------------------
+    c.setFillColor(BLUE)
+    c.rect(0, H - header_h, W, header_h, fill=1, stroke=0)
 
-    # Logo (left)
-    logo_path = get_logo_path()
-    if logo_path.exists():
+    # Logo
+    if os.path.exists(LOGO_PATH):
         try:
-            logo = ImageReader(str(logo_path))
-            logo_w = 55 * mm
-            logo_h = 16 * mm
-            c.drawImage(logo, left, h - header_h + (header_h - logo_h) / 2, width=logo_w, height=logo_h, mask="auto")
+            logo = ImageReader(LOGO_PATH)
+            # Caja del logo aprox
+            logo_w = 78 * mm
+            logo_h = 22 * mm
+            logo_x = M
+            logo_y = H - header_h + (header_h - logo_h) / 2
+            c.drawImage(logo, logo_x, logo_y, width=logo_w, height=logo_h, mask="auto")
         except Exception:
-            # If image fails, just write text
-            c.setFillColor(WHITE)
-            c.setFont(fonts["bold"], 18)
-            c.drawString(left, h - header_h + 8 * mm, "SAPIENCE")
-    else:
-        c.setFillColor(WHITE)
-        c.setFont(fonts["bold"], 18)
-        c.drawString(left, h - header_h + 8 * mm, "SAPIENCE")
+            pass
 
-    # ODC badge (right)
-    odc_full = f"{payload.odc_prefix}-{payload.odc_number}"
-    badge_h = 10 * mm
-    badge_w = 65 * mm
-    badge_x = w - right - badge_w
-    badge_y = h - header_h + (header_h - badge_h) / 2
-    c.setFillColor(WHITE)
-    c.roundRect(badge_x, badge_y, badge_w, badge_h, 3, fill=1, stroke=0)
+    # ODC box (right)
+    odc_box_w = 72 * mm
+    odc_box_h = 14 * mm
+    odc_box_x = W - M - odc_box_w
+    odc_box_y = H - (header_h / 2) - (odc_box_h / 2)
 
-    # "ODC #:" label
-    c.setFillColor(TEXT_DARK)
-    c.setFont(fonts["bold"], 10)
-    c.drawString(badge_x + 6, badge_y + 3.2, "ODC #:")
+    c.setFillColor(colors.white)
+    c.roundRect(odc_box_x, odc_box_y, odc_box_w, odc_box_h, radius=2.5 * mm, fill=1, stroke=0)
 
-    # red pill for number
-    pill_x = badge_x + 27
-    pill_w = badge_w - 33
-    c.setFillColor(ACCENT_RED)
-    c.roundRect(pill_x, badge_y + 1.3, pill_w, badge_h - 2.6, 3, fill=1, stroke=0)
-    c.setFillColor(WHITE)
-    c.setFont(fonts["bold"], 10)
-    c.drawCentredString(pill_x + pill_w / 2, badge_y + 3.2, odc_full)
+    # Separator inside box
+    sep_x = odc_box_x + 32 * mm
+    c.setStrokeColor(colors.HexColor("#2A2A2A"))
+    c.setLineWidth(0.9)
+    c.line(sep_x, odc_box_y + 2, sep_x, odc_box_y + odc_box_h - 2)
 
-    # Body start
-    y = h - header_h - 14 * mm
-
-    # Left info box background
-    box_h = 30 * mm
-    box_w = (content_w * 0.58)
-    box_x = left
-    box_y = y - box_h
-    c.setFillColor(LIGHT_GREY)
-    c.rect(box_x, box_y, box_w, box_h, fill=1, stroke=0)
-
-    # Right info area (Factura)
-    r_x = left + box_w + 10 * mm
-    r_w = w - right - r_x
-
-    # Left labels + values
-    labels = [
-        ("ODC #", odc_full),
-        ("FECHA", parse_date(payload.date).strftime("%d %b %Y").lower()),
-        ("PROVEEDOR", payload.provider),
-        ("SERVICIO", payload.service),
-        ("PROYECTO", payload.project),
-    ]
-
-    label_x = box_x + 6 * mm
-    value_x = box_x + 35 * mm
-    row_y = y - 6 * mm
-    row_gap = 6 * mm
-
-    c.setFillColor(NAVY)
-    c.setFont(fonts["bold"], 11)
-    for i, (lab, val) in enumerate(labels):
-        yy = row_y - i * row_gap
-        c.drawRightString(value_x - 3 * mm, yy, f"{lab}:")
-        c.setFillColor(TEXT_DARK)
-        c.setFont(fonts["regular"], 11)
-        c.drawString(value_x, yy, str(val))
-        c.setFillColor(NAVY)
-        c.setFont(fonts["bold"], 11)
-
-    # Right: FACTURAR A
-    c.setFillColor(NAVY)
-    c.setFont(fonts["bold"], 14)
-    c.drawString(r_x, y - 6 * mm, "FACTURAR A:")
-
-    c.setFillColor(TEXT_DARK)
-    c.setFont(fonts["bold"], 12)
-    c.drawString(r_x, y - 13 * mm, payload.bill_to.name.upper())
-
-    c.setFont(fonts["bold"], 11)
-    c.drawString(r_x, y - 19 * mm, f"RFC: {payload.bill_to.rfc}")
-
-    c.setFont(fonts["regular"], 11)
-    draw_wrapped_text(
+    # Text inside box
+    draw_text_right(
         c,
-        payload.bill_to.address,
-        r_x,
-        y - 26 * mm,
-        r_w,
-        fonts["regular"],
-        11,
-        leading=4.8 * mm,
+        sep_x - 2,
+        odc_box_y + 4.2 * mm,
+        "ODC #:",
+        F_BOLD,
+        12,
+        color=BLUE
+    )
+    draw_text(
+        c,
+        sep_x + 2,
+        odc_box_y + 4.2 * mm,
+        payload.odc_num,
+        F_BOLD,
+        12,
+        color=RED
     )
 
+    # -----------------------------
+    # Top blocks
+    # -----------------------------
+    top_y = H - header_h - 16 * mm
+
+    # Left block dimensions
+    left_x = M
+    left_w = 120 * mm
+    row_h = 11 * mm
+    label_w = 34 * mm
+    divider_x = left_x + label_w
+
+    rows = [
+        ("ODC #", payload.odc_num),
+        ("FECHA", payload.fecha),
+        ("PROVEEDOR", payload.proveedor),
+        ("SERVICIO", payload.servicio),
+        ("PROYECTO", payload.proyecto),
+    ]
+
+    # Draw left block rows with light gray backgrounds
+    c.setLineWidth(1)
+    for i, (lab, val) in enumerate(rows):
+        y = top_y - i * row_h
+
+        # background band (full row)
+        c.setFillColor(LIGHT_GRAY)
+        c.rect(left_x, y - row_h + 1, left_w, row_h, fill=1, stroke=0)
+
+        # label
+        draw_text_right(c, divider_x - 2, y - 7.5, f"{lab}:", F_BOLD, 12, color=BLUE)
+
+        # value
+        draw_text(c, divider_x + 4, y - 7.5, str(val), F_REG, 12, color=TEXT)
+
+    # Vertical divider line for left block
+    c.setStrokeColor(colors.HexColor("#5A5A5A"))
+    c.setLineWidth(1.2)
+    top_block_y1 = top_y + 1
+    top_block_y0 = top_y - len(rows) * row_h + 1
+    c.line(divider_x, top_block_y0, divider_x, top_block_y1)
+
+    # Right block (Facturar A)
+    right_x = left_x + left_w + 24 * mm
+    right_y = top_y
+
+    draw_text(c, right_x, right_y - 7.5, "FACTURAR A:", F_BOLD, 22, color=BLUE)
+    draw_text(c, right_x, right_y - 20 * mm, payload.facturar_a_nombre, F_BOLD, 14, color=TEXT)
+    draw_text(c, right_x, right_y - 30 * mm, f"RFC: {payload.facturar_a_rfc}", F_BOLD, 13, color=TEXT)
+
+    # Multi-line address
+    c.setFont(F_REG, 12)
+    c.setFillColor(TEXT)
+    addr_lines = str(payload.facturar_a_direccion).split("\n")
+    addr_y = right_y - 42 * mm
+    for line in addr_lines:
+        c.drawString(right_x, addr_y, line.strip())
+        addr_y -= 6.5 * mm
+
+    # -----------------------------
     # Table
-    y = box_y - 12 * mm
+    # -----------------------------
+    table_x = M
+    table_w = W - 2 * M
+    table_y_top = top_block_y0 - 20 * mm
 
-    table_x = left
-    table_w = content_w
-    table_top = y
-    header_row_h = 10 * mm
-    row_h = 9 * mm
+    th = 14 * mm  # header height
+    tr = 12.5 * mm  # row height
 
-    # Columns (like reference)
-    col_concept = table_w * 0.52
-    col_unit = table_w * 0.18
-    col_units = table_w * 0.12
-    col_sub = table_w * 0.18
+    # Column widths (tune to match ref)
+    col_concept = table_w * 0.56
+    col_unit = table_w * 0.15
+    col_units = table_w * 0.13
+    col_sub = table_w * 0.16
 
-    # Table header background
-    c.setFillColor(NAVY)
-    c.rect(table_x, table_top - header_row_h, table_w, header_row_h, fill=1, stroke=0)
+    col_x = [
+        table_x,
+        table_x + col_concept,
+        table_x + col_concept + col_unit,
+        table_x + col_concept + col_unit + col_units,
+        table_x + table_w,
+    ]
 
-    c.setFillColor(WHITE)
-    c.setFont(fonts["bold"], 12)
-    c.drawCentredString(table_x + col_concept / 2, table_top - 6.8 * mm, "Concepto")
-    c.drawCentredString(table_x + col_concept + col_unit / 2, table_top - 6.8 * mm, "Costo unitario")
-    c.drawCentredString(table_x + col_concept + col_unit + col_units / 2, table_top - 6.8 * mm, "Unidades")
-    c.drawCentredString(table_x + col_concept + col_unit + col_units + col_sub / 2, table_top - 6.8 * mm, "Subtotal")
+    # Header background
+    c.setFillColor(BLUE)
+    c.rect(table_x, table_y_top - th, table_w, th, fill=1, stroke=0)
 
-    # Rows
-    y_row = table_top - header_row_h
-    c.setStrokeColor(MID_GREY)
+    # Header text
+    draw_text_center(c, table_x + col_concept / 2, table_y_top - 10.5 * mm, "Concepto", F_BOLD, 15, color=colors.white)
+    draw_text_center(c, col_x[1] + col_unit / 2, table_y_top - 10.5 * mm, "Costo unitario", F_BOLD, 15, color=colors.white)
+    draw_text_center(c, col_x[2] + col_units / 2, table_y_top - 10.5 * mm, "Unidades", F_BOLD, 15, color=colors.white)
+    draw_text_center(c, col_x[3] + col_sub / 2, table_y_top - 10.5 * mm, "Subtotal", F_BOLD, 15, color=colors.white)
+
+    # Table borders
+    c.setStrokeColor(LINE_GRAY)
     c.setLineWidth(1)
 
-    total = 0.0
-    for idx, it in enumerate(payload.items):
-        subtotal = float(it.unit_cost) * int(it.units)
-        total += subtotal
+    # Header outer border
+    c.rect(table_x, table_y_top - th, table_w, th, fill=0, stroke=1)
 
-        # zebra background
-        if idx % 2 == 0:
-            c.setFillColor(colors.white)
-        else:
-            c.setFillColor(colors.HexColor("#F6F8FA"))
-        c.rect(table_x, y_row - row_h, table_w, row_h, fill=1, stroke=0)
+    # Vertical separators (including header)
+    for x in col_x[1:-1]:
+        c.line(x, table_y_top - th, x, table_y_top)
 
-        # Borders
-        c.setStrokeColor(MID_GREY)
-        c.rect(table_x, y_row - row_h, table_w, row_h, fill=0, stroke=1)
+    # Rows
+    y = table_y_top - th
+    for idx, item in enumerate(payload.items):
+        row_y_top = y - idx * tr
+        row_y_bottom = row_y_top - tr
 
-        # Vertical lines
-        x1 = table_x + col_concept
-        x2 = x1 + col_unit
-        x3 = x2 + col_units
-        c.line(x1, y_row - row_h, x1, y_row)
-        c.line(x2, y_row - row_h, x2, y_row)
-        c.line(x3, y_row - row_h, x3, y_row)
+        # zebra fill
+        if idx % 2 == 1:
+            c.setFillColor(LIGHT_GRAY)
+            c.rect(table_x, row_y_bottom, table_w, tr, fill=1, stroke=0)
 
-        # Text
-        c.setFillColor(TEXT_DARK)
-        c.setFont(fonts["regular"], 11)
+        # row border
+        c.setStrokeColor(LINE_GRAY)
+        c.setLineWidth(1)
+        c.rect(table_x, row_y_bottom, table_w, tr, fill=0, stroke=1)
 
-        # Concept (wrap)
-        concept_x = table_x + 3 * mm
-        concept_y = y_row - 6.2 * mm
-        draw_wrapped_text(c, it.concept, concept_x, concept_y, col_concept - 6 * mm, fonts["regular"], 11, leading=4.5 * mm)
+        # vertical separators
+        for x in col_x[1:-1]:
+            c.line(x, row_y_bottom, x, row_y_top)
 
-        # Unit cost
-        c.setFont(fonts["regular"], 11)
-        c.drawCentredString(x1 + col_unit / 2, y_row - 6.2 * mm, money(it.unit_cost))
+        # text
+        concept_txt = item.concepto
+        unit_txt = money_mx(item.costo_unitario) if abs(item.costo_unitario - round(item.costo_unitario)) < 1e-9 else money_mx_2(item.costo_unitario)
+        units_txt = str(item.unidades)
+        sub_txt = money_mx(item.subtotal)
+
+        # Concept
+        draw_text(c, table_x + 3 * mm, row_y_bottom + 4.2 * mm, concept_txt, F_REG, 14, color=TEXT)
+
+        # Unit
+        draw_text_center(c, col_x[1] + col_unit / 2, row_y_bottom + 4.2 * mm, unit_txt, F_REG, 14, color=TEXT)
 
         # Units
-        c.drawCentredString(x2 + col_units / 2, y_row - 6.2 * mm, str(it.units))
+        draw_text_center(c, col_x[2] + col_units / 2, row_y_bottom + 4.2 * mm, units_txt, F_REG, 14, color=TEXT)
 
         # Subtotal
-        c.drawCentredString(x3 + col_sub / 2, y_row - 6.2 * mm, money(subtotal))
+        draw_text_center(c, col_x[3] + col_sub / 2, row_y_bottom + 4.2 * mm, sub_txt, F_REG, 14, color=TEXT)
 
-        y_row -= row_h
-
-        # Simple page break guard (if many rows)
-        if y_row < bottom + 40 * mm:
-            c.showPage()
-            c.setFont(fonts["regular"], 11)
-            y_row = h - top
-
-    # Footer note
-    footer_text = "Esta Orden de Compra constituye el acuerdo formal para la prestación del servicio descrito."
-    c.setFillColor(colors.HexColor("#6B7780"))
-    c.setFont(fonts["regular"], 10)
-    c.drawCentredString(w / 2, bottom, footer_text)
+    # Totals (optional) — si quieres la versión con totales abajo a la derecha
+    if payload.mostrar_totales:
+        total = sum(i.subtotal for i in payload.items)
+        totals_y = (table_y_top - th) - len(payload.items) * tr - 18 * mm
+        # puedes activar si lo necesitas; por ahora lo dejo apagable desde JSON
+        # draw_text_right(c, W - M - 40*mm, totals_y, "Total:", F_BOLD, 14, color=TEXT)
+        # draw_text_right(c, W - M, totals_y, money_mx(total), F_BOLD, 14, color=TEXT)
 
     c.showPage()
     c.save()
-    buffer.seek(0)
-    return buffer.getvalue()
+    return buf.getvalue()
 
 
 # -----------------------------
-# Routes
+# Endpoints
 # -----------------------------
 @app.get("/")
-def root():
-    return {
-        "ok": True,
-        "service": "ODCs Generator",
-        "endpoints": {
-            "health": "/health",
-            "generate_pdf": "/generate-odc",
-        },
-    }
-
-
-@app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "service": "odcs"}
 
 
 @app.post("/generate-odc")
-def generate_odc(req: ODCRequest):
-    pdf_bytes = generate_odc_pdf(req)
-    filename = f"ODC_{req.odc_prefix}-{req.odc_number}.pdf"
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"'
-    }
-    return StreamingResponse(io.BytesIO(pdf_bytes), media_type="application/pdf", headers=headers)
+def generate_odc(payload: ODCRequest):
+    pdf_bytes = build_odc_pdf(payload)
+    filename = f"ODC-{payload.odc_num}.pdf".replace(" ", "_")
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )

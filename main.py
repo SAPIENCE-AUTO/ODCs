@@ -1,255 +1,161 @@
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.colors import HexColor, black, white
 from reportlab.pdfgen import canvas
-from reportlab.lib.units import cm
+from reportlab.lib.units import mm
 from io import BytesIO
+from datetime import datetime
 
-# =========================
-# APP
-# =========================
+app = FastAPI(title="ODC PDF Generator")
 
-app = FastAPI()
-
-# =========================
-# CONSTANTES
-# =========================
-
-PAGE_WIDTH, PAGE_HEIGHT = A4
-
-SAP_BLUE = HexColor("#173344")
-SAP_GRAY = HexColor("#F2F2F2")
-SAP_RED = HexColor("#E53935")
-
-# =========================
-# HELPERS
-# =========================
-
-def draw_text(c, text, x, y, size=10, bold=False, color=black):
-    font = "Helvetica-Bold" if bold else "Helvetica"
-    c.setFont(font, size)
-    c.setFillColor(color)
-    c.drawString(x, y, text)
-
-# =========================
-# HEALTH CHECK (para Render)
-# =========================
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# =========================
-# ENDPOINT PRINCIPAL
-# =========================
 
-@app.post("/generate-odc")
+@app.post(
+    "/generate-odc",
+    responses={
+        200: {
+            "content": {"application/pdf": {}},
+            "description": "ODC PDF generated"
+        }
+    },
+)
 def generate_odc(payload: dict):
-    """
-    Genera un PDF de Orden de Compra (ODC).
-    Por ahora usa placeholders/mockup.
-    """
-
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
 
-    # ======================================================
-    # PÁGINA 1
-    # ======================================================
+    # -------------------------
+    # Header
+    # -------------------------
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(30 * mm, height - 25 * mm, "ORDEN DE COMPRA")
 
-    # ---------- HEADER ----------
-    c.setFillColor(SAP_BLUE)
-    c.rect(0, PAGE_HEIGHT - 3.5 * cm, PAGE_WIDTH, 3.5 * cm, fill=1)
-
-    draw_text(c, "SAPIENCE", 2 * cm, PAGE_HEIGHT - 2 * cm, 24, bold=True, color=white)
-    draw_text(c, "Human Insights Strategy", 2 * cm, PAGE_HEIGHT - 2.7 * cm, 10, color=white)
-
-    # Caja ODC derecha
-    box_x = PAGE_WIDTH - 7 * cm
-    box_y = PAGE_HEIGHT - 2.8 * cm
-
-    c.setFillColor(white)
-    c.rect(box_x, box_y, 5.5 * cm, 1.2 * cm, fill=1)
-
-    draw_text(c, "ODC #:", box_x + 0.4 * cm, box_y + 0.35 * cm, 12, bold=True)
-    draw_text(c, "RI-XXXX", box_x + 2.2 * cm, box_y + 0.35 * cm, 12, bold=True, color=SAP_RED)
-
-    # ---------- BLOQUE ADMINISTRATIVO ----------
-    start_y = PAGE_HEIGHT - 4.5 * cm
-    row_h = 0.9 * cm
-    left_x = 2 * cm
-    mid_x = PAGE_WIDTH / 2 - 1 * cm
-
-    labels = ["ODC #", "FECHA", "PROVEEDOR", "SERVICIO", "PROYECTO"]
-    values = [
-        "RI-XXXX",
-        "DD MMM YYYY",
-        "NOMBRE PROVEEDOR",
-        "SERVICIO",
-        "PROYECTO"
-    ]
-
-    for i, (label, value) in enumerate(zip(labels, values)):
-        y = start_y - i * row_h
-
-        c.setFillColor(SAP_GRAY)
-        c.rect(left_x, y, mid_x - left_x, row_h, fill=1)
-
-        draw_text(
-            c,
-            f"{label}:",
-            left_x + 0.2 * cm,
-            y + 0.3 * cm,
-            10,
-            bold=True,
-            color=SAP_BLUE
-        )
-        draw_text(
-            c,
-            value,
-            left_x + 3.2 * cm,
-            y + 0.3 * cm,
-            10
-        )
-
-    # ---------- FACTURAR A ----------
-    draw_text(
-        c,
-        "FACTURAR A:",
-        mid_x + 1 * cm,
-        start_y + 0.3 * cm,
-        14,
-        bold=True,
-        color=SAP_BLUE
+    c.setFont("Helvetica", 10)
+    c.drawRightString(
+        width - 30 * mm,
+        height - 25 * mm,
+        f"ODC: {payload.get('odc_number', '')}"
     )
 
-    draw_text(
-        c,
-        "ASESORES GLOBALES CORPORATIVOS",
-        mid_x + 1 * cm,
-        start_y - 0.6 * cm,
-        11,
-        bold=True
+    c.drawRightString(
+        width - 30 * mm,
+        height - 32 * mm,
+        f"Fecha: {payload.get('date', '')}"
     )
 
-    draw_text(
-        c,
-        "RFC: XXXXXXXX",
-        mid_x + 1 * cm,
-        start_y - 1.4 * cm,
-        10,
-        bold=True
+    # -------------------------
+    # Provider & Project Info
+    # -------------------------
+    y = height - 45 * mm
+
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(30 * mm, y, "Proveedor:")
+    c.setFont("Helvetica", 10)
+    c.drawString(30 * mm, y - 5 * mm, payload.get("provider", ""))
+
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(110 * mm, y, "Proyecto:")
+    c.setFont("Helvetica", 10)
+    c.drawString(110 * mm, y - 5 * mm, payload.get("project", ""))
+
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(110 * mm, y - 12 * mm, "Servicio:")
+    c.setFont("Helvetica", 10)
+    c.drawString(110 * mm, y - 17 * mm, payload.get("service", ""))
+
+    # -------------------------
+    # Bill To
+    # -------------------------
+    bill_to = payload.get("bill_to", {})
+
+    y -= 30 * mm
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(30 * mm, y, "Facturar a:")
+
+    c.setFont("Helvetica", 10)
+    c.drawString(30 * mm, y - 5 * mm, bill_to.get("company", ""))
+    c.drawString(30 * mm, y - 10 * mm, f"RFC: {bill_to.get('rfc', '')}")
+    c.drawString(30 * mm, y - 15 * mm, bill_to.get("address", ""))
+
+    # -------------------------
+    # Items Table
+    # -------------------------
+    y -= 30 * mm
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(30 * mm, y, "Concepto")
+    c.drawRightString(140 * mm, y, "Cantidad")
+    c.drawRightString(165 * mm, y, "Precio")
+    c.drawRightString(190 * mm, y, "Importe")
+
+    c.line(30 * mm, y - 2 * mm, 190 * mm, y - 2 * mm)
+
+    y -= 8 * mm
+    c.setFont("Helvetica", 10)
+
+    subtotal = 0
+    for item in payload.get("items", []):
+        concept = item.get("concept", "")
+        units = item.get("units", 0)
+        unit_price = item.get("unit_price", 0)
+        amount = units * unit_price
+        subtotal += amount
+
+        c.drawString(30 * mm, y, concept[:60])
+        c.drawRightString(140 * mm, y, str(units))
+        c.drawRightString(165 * mm, y, f"${unit_price:,.2f}")
+        c.drawRightString(190 * mm, y, f"${amount:,.2f}")
+
+        y -= 7 * mm
+        if y < 40 * mm:
+            c.showPage()
+            y = height - 40 * mm
+            c.setFont("Helvetica", 10)
+
+    # -------------------------
+    # Totals
+    # -------------------------
+    advance = payload.get("advance", 0)
+    total = payload.get("total", subtotal - advance)
+
+    y -= 10 * mm
+    c.setFont("Helvetica-Bold", 10)
+    c.drawRightString(165 * mm, y, "Subtotal:")
+    c.drawRightString(190 * mm, y, f"${subtotal:,.2f}")
+
+    y -= 6 * mm
+    c.drawRightString(165 * mm, y, "Anticipo:")
+    c.drawRightString(190 * mm, y, f"${advance:,.2f}")
+
+    y -= 6 * mm
+    c.drawRightString(165 * mm, y, "Total:")
+    c.drawRightString(190 * mm, y, f"${total:,.2f}")
+
+    # -------------------------
+    # Footer
+    # -------------------------
+    c.setFont("Helvetica", 8)
+    c.drawString(
+        30 * mm,
+        20 * mm,
+        "Esta Orden de Compra constituye el acuerdo formal para la prestación del servicio descrito."
     )
-
-    draw_text(
-        c,
-        "Dirección completa de facturación\nCiudad, CP, País",
-        mid_x + 1 * cm,
-        start_y - 2.3 * cm,
-        10
-    )
-
-    # ---------- TABLA DE CONCEPTOS ----------
-    table_x = 3 * cm
-    table_y = start_y - 6 * cm
-    table_w = PAGE_WIDTH - 6 * cm
-    row_h = 0.9 * cm
-
-    col_ratios = [0.6, 0.15, 0.1, 0.15]
-    col_x = [table_x]
-
-    for r in col_ratios[:-1]:
-        col_x.append(col_x[-1] + table_w * r)
-
-    headers = ["Concepto", "Precio unitario", "Unidades", "Precio Total"]
-
-    c.setFillColor(SAP_BLUE)
-    c.rect(table_x, table_y, table_w, row_h, fill=1)
-
-    for i, h in enumerate(headers):
-        draw_text(
-            c,
-            h,
-            col_x[i] + 0.3 * cm,
-            table_y + 0.3 * cm,
-            10,
-            bold=True,
-            color=white
-        )
-
-    # Filas dummy
-    for r in range(4):
-        y = table_y - (r + 1) * row_h
-        c.setFillColor(SAP_GRAY if r % 2 == 0 else white)
-        c.rect(table_x, y, table_w, row_h, fill=1)
-
-        draw_text(c, "Concepto de ejemplo", col_x[0] + 0.3 * cm, y + 0.3 * cm)
-        draw_text(c, "$0.00", col_x[1] + 0.3 * cm, y + 0.3 * cm)
-        draw_text(c, "0", col_x[2] + 0.3 * cm, y + 0.3 * cm)
-        draw_text(c, "$0.00", col_x[3] + 0.3 * cm, y + 0.3 * cm)
-
-    # ---------- TOTALES ----------
-    totals_x = table_x + table_w - 7 * cm
-    totals_y = table_y - 6 * row_h
-
-    labels = ["Subtotal", "Anticipo", "Total"]
-    values = ["$0.00", "-$0.00", "$0.00"]
-
-    for i, (label, value) in enumerate(zip(labels, values)):
-        y = totals_y - i * row_h
-
-        c.setFillColor(SAP_BLUE)
-        c.rect(totals_x, y, 3.5 * cm, row_h, fill=1)
-
-        c.setFillColor(white)
-        c.rect(totals_x + 3.5 * cm, y, 3.5 * cm, row_h, fill=1)
-
-        draw_text(c, label, totals_x + 0.3 * cm, y + 0.3 * cm, 10, bold=True, color=white)
-        draw_text(c, value, totals_x + 3.7 * cm, y + 0.3 * cm, 10, bold=True)
-
-    c.showPage()
-
-    # ======================================================
-    # PÁGINA 2 – CONDICIONES
-    # ======================================================
-
-    draw_text(
-        c,
-        "NOTAS Y CONDICIONES DE LA ORDEN DE COMPRA",
-        2 * cm,
-        PAGE_HEIGHT - 2.5 * cm,
-        14,
-        bold=True,
-        color=SAP_BLUE
-    )
-
-    text = c.beginText(2 * cm, PAGE_HEIGHT - 4 * cm)
-    text.setFont("Helvetica", 9)
-
-    sections = [
-        "Emisión y entrega de factura",
-        "Revisión, validación y aceptación",
-        "Tiempos de pago",
-        "Condiciones de servicio",
-        "Cambio de alcance, cantidades o precios",
-        "Cancelaciones y reprogramaciones",
-        "Confidencialidad y manejo de información",
-        "Protección de datos personales",
-        "Comunicación y soporte",
-        "Cierre administrativo del proyecto"
-    ]
-
-    for section in sections:
-        text.setFont("Helvetica-Bold", 9)
-        text.textLine(section)
-        text.setFont("Helvetica", 9)
-        text.textLine("– Texto legal de ejemplo.")
-        text.textLine(" ")
-
-    c.drawText(text)
 
     c.save()
-    buffer.seek(0)
 
-    return StreamingResponse(buffer, media_type="application/pdf")
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+
+    filename = f"ODC_{payload.get('odc_number', 'ODC')}.pdf"
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename=\"{filename}\"',
+            "Cache-Control": "no-store",
+        },
+    )

@@ -1,430 +1,396 @@
 from __future__ import annotations
 
+import io
 import os
-from io import BytesIO
+from datetime import date, datetime
+from pathlib import Path
 from typing import List, Optional
 
-import requests
-from fastapi import FastAPI, Response
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
-from reportlab.lib import colors
-from reportlab.lib.colors import HexColor
+
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
-from reportlab.lib.utils import ImageReader
+from reportlab.lib import colors
+from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.pdfgen import canvas
-from reportlab.platypus import Table, TableStyle
+from reportlab.lib.utils import ImageReader
 
 
-PAGE_W, PAGE_H = A4
+# -----------------------------
+# App
+# -----------------------------
+app = FastAPI(title="ODCs Generator", version="1.0.0")
 
-SAP_BLUE = HexColor("#153646")
-SAP_BLUE_2 = HexColor("#23495A")
-LIGHT_GRAY = HexColor("#F2F2F2")
-MID_GRAY = HexColor("#D9D9D9")
-TEXT_DARK = HexColor("#111111")
-ACCENT_RED = HexColor("#FF3B30")
-
-DEFAULT_LOGO_URL = "https://i.imghippo.com/files/qW2090cp.png"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = BASE_DIR / "assets"
 
 
-def money_fmt(value: float) -> str:
-    return "${:,.2f}".format(float(value))
-
-
-def safe_int(value) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return 0
-
-
-def safe_float(value) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return 0.0
-
-
-def register_fonts_if_present() -> None:
-    fonts_dir = os.path.join(BASE_DIR, "assets", "fonts")
-    files = {
-        "Montserrat": "Montserrat-Regular.ttf",
-        "Montserrat-Medium": "Montserrat-Medium.ttf",
-        "Montserrat-SemiBold": "Montserrat-SemiBold.ttf",
-        "Montserrat-Bold": "Montserrat-Bold.ttf",
-    }
-    for font_name, filename in files.items():
-        path = os.path.join(fonts_dir, filename)
-        if os.path.isfile(path):
-            try:
-                pdfmetrics.registerFont(TTFont(font_name, path))
-            except Exception:
-                pass
-
-
-def pick_font(preferred: str, fallback: str = "Helvetica") -> str:
-    try:
-        pdfmetrics.getFont(preferred)
-        return preferred
-    except Exception:
-        return fallback
-
-
-def load_logo_from_url(url: str) -> ImageReader:
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    return ImageReader(BytesIO(r.content))
-
-
-class FacturarA(BaseModel):
-    razon_social: str
+# -----------------------------
+# Models
+# -----------------------------
+class BillTo(BaseModel):
+    name: str
     rfc: str
-    direccion_linea1: str
-    direccion_linea2: Optional[str] = ""
+    address: str
 
 
-class Item(BaseModel):
-    concepto: str
-    precio_unitario: float
-    unidades: int
-
-    @property
-    def subtotal(self) -> float:
-        return safe_float(self.precio_unitario) * safe_int(self.unidades)
+class ODCItem(BaseModel):
+    concept: str
+    unit_cost: float = Field(..., ge=0)
+    units: int = Field(..., ge=1)
 
 
 class ODCRequest(BaseModel):
-    odc_num: str = Field(..., examples=["RI-02497"])
-    fecha: str = Field(..., examples=["08 enero 2026"])
-    proveedor: str
-    servicio: str
-    proyecto: str
-
-    facturar_a: FacturarA
-    items: List[Item]
-    anticipo: float = 0.0
-
-    condiciones_titulo: str = "NOTAS Y CONDICIONES DE LA ORDEN DE COMPRA"
-    condiciones: Optional[List[dict]] = None
+    odc_prefix: str = Field(default="RI")
+    odc_number: str = Field(..., description="Ej: 02497")
+    date: Optional[str] = Field(default=None, description="YYYY-MM-DD. Si no, hoy.")
+    provider: str
+    service: str
+    project: str
+    bill_to: BillTo
+    items: List[ODCItem]
 
 
-def draw_header(c: canvas.Canvas, odc_num: str, logo: ImageReader) -> None:
-    header_h = 90
-    y0 = PAGE_H - header_h
+# -----------------------------
+# Helpers
+# -----------------------------
+def try_register_montserrat() -> dict:
+    """
+    Tries to register Montserrat fonts if present.
+    Returns a dict with font names to use.
+    """
+    fonts_dir = ASSETS_DIR / "fonts"
+    regular = fonts_dir / "Montserrat-Regular.ttf"
+    bold = fonts_dir / "Montserrat-Bold.ttf"
+    semibold = fonts_dir / "Montserrat-SemiBold.ttf"
 
-    c.setFillColor(SAP_BLUE)
-    c.rect(0, y0, PAGE_W, header_h, stroke=0, fill=1)
+    # Defaults (built-in)
+    out = {
+        "regular": "Helvetica",
+        "bold": "Helvetica-Bold",
+        "semibold": "Helvetica-Bold",
+    }
 
-    c.drawImage(logo, 22, y0 + 22, width=190, height=48, mask="auto")
+    try:
+        if regular.exists():
+            pdfmetrics.registerFont(TTFont("Montserrat", str(regular)))
+            out["regular"] = "Montserrat"
+        if bold.exists():
+            pdfmetrics.registerFont(TTFont("Montserrat-Bold", str(bold)))
+            out["bold"] = "Montserrat-Bold"
+        if semibold.exists():
+            pdfmetrics.registerFont(TTFont("Montserrat-SemiBold", str(semibold)))
+            out["semibold"] = "Montserrat-SemiBold"
+    except Exception:
+        # If anything goes wrong, just fall back silently
+        pass
 
-    box_w, box_h = 210, 34
-    box_x = PAGE_W - box_w - 24
-    box_y = y0 + 34
+    return out
 
-    c.setFillColor(LIGHT_GRAY)
-    c.rect(box_x, box_y, box_w, box_h, stroke=0, fill=1)
 
-    c.setStrokeColor(MID_GRAY)
-    c.setLineWidth(1)
-    c.line(box_x + 105, box_y, box_x + 105, box_y + box_h)
+def money(v: float) -> str:
+    return f"${v:,.2f}"
 
-    font_sb = pick_font("Montserrat-SemiBold", "Helvetica-Bold")
-    font_b = pick_font("Montserrat-Bold", "Helvetica-Bold")
 
-    c.setFillColor(SAP_BLUE)
-    c.setFont(font_sb, 12)
-    c.drawRightString(box_x + 95, box_y + 11, "ODC #:")
+def parse_date(d: Optional[str]) -> date:
+    if not d:
+        return date.today()
+    # Accept YYYY-MM-DD
+    return datetime.strptime(d, "%Y-%m-%d").date()
 
+
+def draw_wrapped_text(c: rl_canvas.Canvas, text: str, x: float, y: float, max_w: float, font: str, size: int, leading: float):
+    """
+    Basic wrapper: splits by spaces and wraps within max_w.
+    Returns final y after drawing.
+    """
+    c.setFont(font, size)
+    words = (text or "").split()
+    line = ""
+    lines = []
+    for w in words:
+        test = (line + " " + w).strip()
+        if c.stringWidth(test, font, size) <= max_w:
+            line = test
+        else:
+            if line:
+                lines.append(line)
+            line = w
+    if line:
+        lines.append(line)
+
+    for ln in lines:
+        c.drawString(x, y, ln)
+        y -= leading
+    return y
+
+
+def get_logo_path() -> Path:
+    # Prefer renamed version, but accept the original name with spaces
+    p1 = ASSETS_DIR / "logo_sapience_blanco.png"
+    p2 = ASSETS_DIR / "logo sapience blanco.png"
+    if p1.exists():
+        return p1
+    return p2
+
+
+# -----------------------------
+# PDF Generator
+# -----------------------------
+def generate_odc_pdf(payload: ODCRequest) -> bytes:
+    fonts = try_register_montserrat()
+
+    buffer = io.BytesIO()
+    c = rl_canvas.Canvas(buffer, pagesize=A4)
+    w, h = A4
+
+    # Brand colors (ajústalos si quieres)
+    NAVY = colors.HexColor("#143647")   # header + table header
+    LIGHT_GREY = colors.HexColor("#EEF2F5")
+    MID_GREY = colors.HexColor("#D9E1E7")
+    TEXT_DARK = colors.HexColor("#0E1A22")
+    ACCENT_RED = colors.HexColor("#E53935")
+    WHITE = colors.white
+
+    # Margins
+    left = 18 * mm
+    right = 18 * mm
+    top = 18 * mm
+    bottom = 18 * mm
+    content_w = w - left - right
+
+    # Header bar
+    header_h = 26 * mm
+    c.setFillColor(NAVY)
+    c.rect(0, h - header_h, w, header_h, fill=1, stroke=0)
+
+    # Logo (left)
+    logo_path = get_logo_path()
+    if logo_path.exists():
+        try:
+            logo = ImageReader(str(logo_path))
+            logo_w = 55 * mm
+            logo_h = 16 * mm
+            c.drawImage(logo, left, h - header_h + (header_h - logo_h) / 2, width=logo_w, height=logo_h, mask="auto")
+        except Exception:
+            # If image fails, just write text
+            c.setFillColor(WHITE)
+            c.setFont(fonts["bold"], 18)
+            c.drawString(left, h - header_h + 8 * mm, "SAPIENCE")
+    else:
+        c.setFillColor(WHITE)
+        c.setFont(fonts["bold"], 18)
+        c.drawString(left, h - header_h + 8 * mm, "SAPIENCE")
+
+    # ODC badge (right)
+    odc_full = f"{payload.odc_prefix}-{payload.odc_number}"
+    badge_h = 10 * mm
+    badge_w = 65 * mm
+    badge_x = w - right - badge_w
+    badge_y = h - header_h + (header_h - badge_h) / 2
+    c.setFillColor(WHITE)
+    c.roundRect(badge_x, badge_y, badge_w, badge_h, 3, fill=1, stroke=0)
+
+    # "ODC #:" label
+    c.setFillColor(TEXT_DARK)
+    c.setFont(fonts["bold"], 10)
+    c.drawString(badge_x + 6, badge_y + 3.2, "ODC #:")
+
+    # red pill for number
+    pill_x = badge_x + 27
+    pill_w = badge_w - 33
     c.setFillColor(ACCENT_RED)
-    c.setFont(font_b, 13)
-    c.drawString(box_x + 115, box_y + 11, odc_num)
+    c.roundRect(pill_x, badge_y + 1.3, pill_w, badge_h - 2.6, 3, fill=1, stroke=0)
+    c.setFillColor(WHITE)
+    c.setFont(fonts["bold"], 10)
+    c.drawCentredString(pill_x + pill_w / 2, badge_y + 3.2, odc_full)
 
+    # Body start
+    y = h - header_h - 14 * mm
 
-def draw_kv_block_left(c: canvas.Canvas, x: float, y_top: float, label: str, value: str) -> float:
-    font_sb = pick_font("Montserrat-SemiBold", "Helvetica-Bold")
-    font_r = pick_font("Montserrat", "Helvetica")
+    # Left info box background
+    box_h = 30 * mm
+    box_w = (content_w * 0.58)
+    box_x = left
+    box_y = y - box_h
+    c.setFillColor(LIGHT_GREY)
+    c.rect(box_x, box_y, box_w, box_h, fill=1, stroke=0)
 
-    row_h = 16
-    label_w = 33 * mm
-    value_w = 95 * mm
-    block_h = 26
+    # Right info area (Factura)
+    r_x = left + box_w + 10 * mm
+    r_w = w - right - r_x
 
-    c.setFillColor(LIGHT_GRAY)
-    c.rect(x + label_w, y_top - block_h + 4, value_w, block_h, stroke=0, fill=1)
-
-    c.setFillColor(SAP_BLUE)
-    c.setFont(font_sb, 12)
-    c.drawRightString(x + label_w - 6, y_top - row_h + 2, f"{label}:")
-
-    c.setFillColor(TEXT_DARK)
-    c.setFont(font_r, 12)
-    c.drawString(x + label_w + 8, y_top - row_h + 2, value)
-
-    c.setStrokeColor(MID_GRAY)
-    c.setLineWidth(1)
-    c.line(x + label_w, y_top - block_h + 4, x + label_w, y_top + 4)
-
-    return y_top - (block_h + 8)
-
-
-def draw_facturar_a(c: canvas.Canvas, x: float, y_top: float, data: FacturarA) -> None:
-    font_b = pick_font("Montserrat-Bold", "Helvetica-Bold")
-    font_sb = pick_font("Montserrat-SemiBold", "Helvetica-Bold")
-    font_r = pick_font("Montserrat", "Helvetica")
-
-    c.setFillColor(SAP_BLUE)
-    c.setFont(font_b, 20)
-    c.drawString(x, y_top, "FACTURAR A:")
-
-    y = y_top - 28
-
-    c.setFillColor(TEXT_DARK)
-    c.setFont(font_b, 14)
-    c.drawString(x, y, data.razon_social)
-
-    y -= 22
-    c.setFont(font_sb, 12)
-    c.drawString(x, y, f"RFC: {data.rfc}")
-
-    y -= 22
-    c.setFont(font_r, 12)
-    c.drawString(x, y, data.direccion_linea1)
-
-    if (data.direccion_linea2 or "").strip():
-        y -= 18
-        c.drawString(x, y, data.direccion_linea2)
-
-
-def build_items_table(items: List[Item]) -> Table:
-    font_b = pick_font("Montserrat-Bold", "Helvetica-Bold")
-    font_r = pick_font("Montserrat", "Helvetica")
-
-    data = [["Concepto", "Precio unitario", "Unidades", "Subtotal"]]
-    for it in items:
-        data.append([it.concepto, money_fmt(it.precio_unitario), str(it.unidades), money_fmt(it.subtotal)])
-
-    col_widths = [110 * mm, 40 * mm, 30 * mm, 40 * mm]
-    t = Table(data, colWidths=col_widths)
-
-    t.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), SAP_BLUE_2),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), font_b),
-                ("FONTSIZE", (0, 0), (-1, 0), 11),
-                ("ALIGN", (1, 0), (-1, 0), "CENTER"),
-                ("FONTNAME", (0, 1), (-1, -1), font_r),
-                ("FONTSIZE", (0, 1), (-1, -1), 10.5),
-                ("GRID", (0, 0), (-1, -1), 0.6, MID_GRAY),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 8),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-                ("TOPPADDING", (0, 0), (-1, -1), 6),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                ("ALIGN", (1, 1), (-1, -1), "CENTER"),
-                ("ALIGN", (0, 1), (0, -1), "LEFT"),
-            ]
-        )
-    )
-    return t
-
-
-def draw_table(c: canvas.Canvas, table: Table, x: float, y_top: float) -> float:
-    w, h = table.wrap(0, 0)
-    table.drawOn(c, x, y_top - h)
-    return h
-
-
-def draw_totals_box(c: canvas.Canvas, x: float, y_top: float, subtotal: float, anticipo: float) -> None:
-    font_b = pick_font("Montserrat-Bold", "Helvetica-Bold")
-    font_sb = pick_font("Montserrat-SemiBold", "Helvetica-Bold")
-
-    total = subtotal - safe_float(anticipo)
-
-    box_w = 95 * mm
-    row_h = 14 * mm
-    box_h = row_h * 3
-
-    c.setFillColor(SAP_BLUE_2)
-    c.rect(x, y_top - box_h, box_w * 0.55, box_h, stroke=0, fill=1)
-
-    c.setFillColor(colors.white)
-    c.rect(x + box_w * 0.55, y_top - box_h, box_w * 0.45, box_h, stroke=1, fill=1)
-
-    c.setStrokeColor(MID_GRAY)
-    c.setLineWidth(1)
-    c.line(x, y_top - row_h, x + box_w, y_top - row_h)
-    c.line(x, y_top - row_h * 2, x + box_w, y_top - row_h * 2)
-
-    labels = ["Subtotal", "Anticipo", "Total"]
-    values = [
-        money_fmt(subtotal),
-        f"-{money_fmt(anticipo)}" if anticipo else money_fmt(0),
-        money_fmt(total),
+    # Left labels + values
+    labels = [
+        ("ODC #", odc_full),
+        ("FECHA", parse_date(payload.date).strftime("%d %b %Y").lower()),
+        ("PROVEEDOR", payload.provider),
+        ("SERVICIO", payload.service),
+        ("PROYECTO", payload.project),
     ]
 
-    for i, (lab, val) in enumerate(zip(labels, values)):
-        y = y_top - row_h * i - 10 * mm
+    label_x = box_x + 6 * mm
+    value_x = box_x + 35 * mm
+    row_y = y - 6 * mm
+    row_gap = 6 * mm
 
-        c.setFillColor(colors.white)
-        c.setFont(font_b, 13)
-        c.drawRightString(x + box_w * 0.53, y, lab)
-
-        if lab == "Anticipo" and safe_float(anticipo) > 0:
-            c.setFillColor(ACCENT_RED)
-        else:
-            c.setFillColor(TEXT_DARK)
-
-        c.setFont(font_sb, 13)
-        c.drawString(x + box_w * 0.58, y, val)
-
-
-def draw_footer_note(c: canvas.Canvas, text: str) -> None:
-    font_r = pick_font("Montserrat", "Helvetica")
-    c.setFillColor(TEXT_DARK)
-    c.setFont(font_r, 9.5)
-    c.drawCentredString(PAGE_W / 2, 18 * mm, text)
-
-
-def draw_conditions_page(c: canvas.Canvas, title: str, sections: Optional[List[dict]]) -> None:
-    c.showPage()
-
-    font_b = pick_font("Montserrat-Bold", "Helvetica-Bold")
-    font_sb = pick_font("Montserrat-SemiBold", "Helvetica-Bold")
-    font_r = pick_font("Montserrat", "Helvetica")
-
-    c.setFillColor(TEXT_DARK)
-    c.setFont(font_b, 14)
-    c.drawCentredString(PAGE_W / 2, PAGE_H - 25 * mm, title)
-
-    margin_x = 18 * mm
-    top = PAGE_H - 40 * mm
-    col_gap = 14 * mm
-    col_w = (PAGE_W - margin_x * 2 - col_gap) / 2
-
-    x_left = margin_x
-    x_right = margin_x + col_w + col_gap
-    y_left = top
-    y_right = top
-
-    if not sections:
-        c.setFont(font_r, 11)
-        c.drawString(x_left, y_left, "Sin condiciones configuradas.")
-        return
-
-    def draw_section(x: float, y: float, sec: dict) -> float:
-        c.setFont(font_sb, 11)
+    c.setFillColor(NAVY)
+    c.setFont(fonts["bold"], 11)
+    for i, (lab, val) in enumerate(labels):
+        yy = row_y - i * row_gap
+        c.drawRightString(value_x - 3 * mm, yy, f"{lab}:")
         c.setFillColor(TEXT_DARK)
-        c.drawString(x, y, (sec.get("titulo", "") or "").strip())
-        y -= 8 * mm
+        c.setFont(fonts["regular"], 11)
+        c.drawString(value_x, yy, str(val))
+        c.setFillColor(NAVY)
+        c.setFont(fonts["bold"], 11)
 
-        bullets = sec.get("bullets", []) or []
-        c.setFont(font_r, 10.2)
+    # Right: FACTURAR A
+    c.setFillColor(NAVY)
+    c.setFont(fonts["bold"], 14)
+    c.drawString(r_x, y - 6 * mm, "FACTURAR A:")
 
-        for b in bullets:
-            text = (b or "").strip()
-            if not text:
-                continue
+    c.setFillColor(TEXT_DARK)
+    c.setFont(fonts["bold"], 12)
+    c.drawString(r_x, y - 13 * mm, payload.bill_to.name.upper())
 
-            max_chars = 78
-            lines = []
-            while len(text) > max_chars:
-                cut = text.rfind(" ", 0, max_chars)
-                if cut <= 0:
-                    cut = max_chars
-                lines.append(text[:cut].strip())
-                text = text[cut:].strip()
-            if text:
-                lines.append(text)
+    c.setFont(fonts["bold"], 11)
+    c.drawString(r_x, y - 19 * mm, f"RFC: {payload.bill_to.rfc}")
 
-            for j, line in enumerate(lines):
-                prefix = "— " if j == 0 else "  "
-                c.drawString(x, y, f"{prefix}{line}")
-                y -= 5.2 * mm
+    c.setFont(fonts["regular"], 11)
+    draw_wrapped_text(
+        c,
+        payload.bill_to.address,
+        r_x,
+        y - 26 * mm,
+        r_w,
+        fonts["regular"],
+        11,
+        leading=4.8 * mm,
+    )
 
-            y -= 2.5 * mm
+    # Table
+    y = box_y - 12 * mm
 
-        y -= 3 * mm
-        return y
+    table_x = left
+    table_w = content_w
+    table_top = y
+    header_row_h = 10 * mm
+    row_h = 9 * mm
 
-    for idx, sec in enumerate(sections):
+    # Columns (like reference)
+    col_concept = table_w * 0.52
+    col_unit = table_w * 0.18
+    col_units = table_w * 0.12
+    col_sub = table_w * 0.18
+
+    # Table header background
+    c.setFillColor(NAVY)
+    c.rect(table_x, table_top - header_row_h, table_w, header_row_h, fill=1, stroke=0)
+
+    c.setFillColor(WHITE)
+    c.setFont(fonts["bold"], 12)
+    c.drawCentredString(table_x + col_concept / 2, table_top - 6.8 * mm, "Concepto")
+    c.drawCentredString(table_x + col_concept + col_unit / 2, table_top - 6.8 * mm, "Costo unitario")
+    c.drawCentredString(table_x + col_concept + col_unit + col_units / 2, table_top - 6.8 * mm, "Unidades")
+    c.drawCentredString(table_x + col_concept + col_unit + col_units + col_sub / 2, table_top - 6.8 * mm, "Subtotal")
+
+    # Rows
+    y_row = table_top - header_row_h
+    c.setStrokeColor(MID_GREY)
+    c.setLineWidth(1)
+
+    total = 0.0
+    for idx, it in enumerate(payload.items):
+        subtotal = float(it.unit_cost) * int(it.units)
+        total += subtotal
+
+        # zebra background
         if idx % 2 == 0:
-            y_left = draw_section(x_left, y_left, sec)
-            if y_left < 25 * mm:
-                c.showPage()
-                c.setFont(font_b, 14)
-                c.drawCentredString(PAGE_W / 2, PAGE_H - 25 * mm, title)
-                y_left = top
-                y_right = top
+            c.setFillColor(colors.white)
         else:
-            y_right = draw_section(x_right, y_right, sec)
-            if y_right < 25 * mm:
-                c.showPage()
-                c.setFont(font_b, 14)
-                c.drawCentredString(PAGE_W / 2, PAGE_H - 25 * mm, title)
-                y_left = top
-                y_right = top
+            c.setFillColor(colors.HexColor("#F6F8FA"))
+        c.rect(table_x, y_row - row_h, table_w, row_h, fill=1, stroke=0)
 
+        # Borders
+        c.setStrokeColor(MID_GREY)
+        c.rect(table_x, y_row - row_h, table_w, row_h, fill=0, stroke=1)
 
-def generate_pdf(payload: ODCRequest) -> bytes:
-    register_fonts_if_present()
-    logo = load_logo_from_url(DEFAULT_LOGO_URL)
+        # Vertical lines
+        x1 = table_x + col_concept
+        x2 = x1 + col_unit
+        x3 = x2 + col_units
+        c.line(x1, y_row - row_h, x1, y_row)
+        c.line(x2, y_row - row_h, x2, y_row)
+        c.line(x3, y_row - row_h, x3, y_row)
 
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
+        # Text
+        c.setFillColor(TEXT_DARK)
+        c.setFont(fonts["regular"], 11)
 
-    draw_header(c, payload.odc_num, logo)
+        # Concept (wrap)
+        concept_x = table_x + 3 * mm
+        concept_y = y_row - 6.2 * mm
+        draw_wrapped_text(c, it.concept, concept_x, concept_y, col_concept - 6 * mm, fonts["regular"], 11, leading=4.5 * mm)
 
-    left_x = 18 * mm
-    right_x = 115 * mm + 18 * mm
-    y_top = PAGE_H - 105
+        # Unit cost
+        c.setFont(fonts["regular"], 11)
+        c.drawCentredString(x1 + col_unit / 2, y_row - 6.2 * mm, money(it.unit_cost))
 
-    y = y_top
-    y = draw_kv_block_left(c, left_x, y, "ODC #", payload.odc_num)
-    y = draw_kv_block_left(c, left_x, y, "FECHA", payload.fecha)
-    y = draw_kv_block_left(c, left_x, y, "PROVEEDOR", payload.proveedor)
-    y = draw_kv_block_left(c, left_x, y, "SERVICIO", payload.servicio)
-    y = draw_kv_block_left(c, left_x, y, "PROYECTO", payload.proyecto)
+        # Units
+        c.drawCentredString(x2 + col_units / 2, y_row - 6.2 * mm, str(it.units))
 
-    draw_facturar_a(c, right_x, y_top - 18, payload.facturar_a)
+        # Subtotal
+        c.drawCentredString(x3 + col_sub / 2, y_row - 6.2 * mm, money(subtotal))
 
-    table = build_items_table(payload.items)
-    table_x = 18 * mm
-    table_y_top = y - 10 * mm
-    table_h = draw_table(c, table, table_x, table_y_top)
+        y_row -= row_h
 
-    subtotal = sum([it.subtotal for it in payload.items])
-    anticipo = safe_float(payload.anticipo)
+        # Simple page break guard (if many rows)
+        if y_row < bottom + 40 * mm:
+            c.showPage()
+            c.setFont(fonts["regular"], 11)
+            y_row = h - top
 
-    totals_x = PAGE_W - (18 * mm) - (95 * mm)
-    totals_y_top = table_y_top - table_h - 10 * mm
-    draw_totals_box(c, totals_x, totals_y_top, subtotal, anticipo)
+    # Footer note
+    footer_text = "Esta Orden de Compra constituye el acuerdo formal para la prestación del servicio descrito."
+    c.setFillColor(colors.HexColor("#6B7780"))
+    c.setFont(fonts["regular"], 10)
+    c.drawCentredString(w / 2, bottom, footer_text)
 
-    draw_footer_note(c, "Esta Orden de Compra constituye el acuerdo formal para la prestación del servicio descrito.")
-
-    draw_conditions_page(c, payload.condiciones_titulo, payload.condiciones)
-
+    c.showPage()
     c.save()
-    return buf.getvalue()
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
-app = FastAPI(title="ODCs PDF Generator", version="1.0.0")
-
-
+# -----------------------------
+# Routes
+# -----------------------------
 @app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "ODCs Generator",
+        "endpoints": {
+            "health": "/health",
+            "generate_pdf": "/generate-odc",
+        },
+    }
+
+
+@app.get("/health")
 def health():
-    return {"ok": True, "service": "ODCs PDF Generator"}
+    return {"ok": True}
 
 
 @app.post("/generate-odc")
-def generate_odc(payload: ODCRequest):
-    pdf_bytes = generate_pdf(payload)
-    filename = f"ODC-{payload.odc_num}.pdf".replace(" ", "_")
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+def generate_odc(req: ODCRequest):
+    pdf_bytes = generate_odc_pdf(req)
+    filename = f"ODC_{req.odc_prefix}-{req.odc_number}.pdf"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"'
+    }
+    return StreamingResponse(io.BytesIO(pdf_bytes), media_type="application/pdf", headers=headers)

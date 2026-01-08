@@ -1,5 +1,3 @@
-```python
-# main.py
 from __future__ import annotations
 
 import os
@@ -20,12 +18,8 @@ from reportlab.pdfgen import canvas
 from reportlab.platypus import Table, TableStyle
 
 
-# -----------------------------
-# Config / Brand
-# -----------------------------
 PAGE_W, PAGE_H = A4
 
-# Ajusta estos HEX a tu brand exacto cuando quieras
 SAP_BLUE = HexColor("#153646")
 SAP_BLUE_2 = HexColor("#23495A")
 LIGHT_GRAY = HexColor("#F2F2F2")
@@ -34,7 +28,6 @@ TEXT_DARK = HexColor("#111111")
 ACCENT_RED = HexColor("#FF3B30")
 
 DEFAULT_LOGO_URL = "https://i.imghippo.com/files/qW2090cp.png"
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -57,15 +50,6 @@ def safe_float(value) -> float:
 
 
 def register_fonts_if_present() -> None:
-    """
-    Montserrat sólo funcionará si los TTF existen en el repo.
-    Estructura recomendada:
-      assets/fonts/Montserrat-Regular.ttf
-      assets/fonts/Montserrat-Medium.ttf
-      assets/fonts/Montserrat-SemiBold.ttf
-      assets/fonts/Montserrat-Bold.ttf
-    Si no están, cae a Helvetica sin romper.
-    """
     fonts_dir = os.path.join(BASE_DIR, "assets", "fonts")
     files = {
         "Montserrat": "Montserrat-Regular.ttf",
@@ -79,12 +63,10 @@ def register_fonts_if_present() -> None:
             try:
                 pdfmetrics.registerFont(TTFont(font_name, path))
             except Exception:
-                # Si falla por cualquier razón, lo ignoramos para no tumbar el servicio
                 pass
 
 
 def pick_font(preferred: str, fallback: str = "Helvetica") -> str:
-    """Devuelve preferred si está registrada, si no fallback."""
     try:
         pdfmetrics.getFont(preferred)
         return preferred
@@ -98,9 +80,6 @@ def load_logo_from_url(url: str) -> ImageReader:
     return ImageReader(BytesIO(r.content))
 
 
-# -----------------------------
-# Input Models
-# -----------------------------
 class FacturarA(BaseModel):
     razon_social: str
     rfc: str
@@ -126,38 +105,22 @@ class ODCRequest(BaseModel):
     proyecto: str
 
     facturar_a: FacturarA
-
     items: List[Item]
-
     anticipo: float = 0.0
 
-    # Condiciones para la segunda página (lista de secciones con bullets)
-    # Si no mandas nada, igual genera 2 páginas pero la 2da dice “Sin condiciones”.
     condiciones_titulo: str = "NOTAS Y CONDICIONES DE LA ORDEN DE COMPRA"
     condiciones: Optional[List[dict]] = None
-    # Formato sugerido:
-    # "condiciones": [
-    #   {"titulo": "Emisión y entrega de factura", "bullets": ["...", "..."]},
-    #   {"titulo": "Tiempos de pago", "bullets": ["...", "..."]},
-    # ]
 
 
-# -----------------------------
-# PDF Drawing Helpers
-# -----------------------------
 def draw_header(c: canvas.Canvas, odc_num: str, logo: ImageReader) -> None:
     header_h = 90
     y0 = PAGE_H - header_h
 
-    # Barra azul
     c.setFillColor(SAP_BLUE)
     c.rect(0, y0, PAGE_W, header_h, stroke=0, fill=1)
 
-    # Logo
-    # Ajusta width/height si tu logo viene más ancho/alto
     c.drawImage(logo, 22, y0 + 22, width=190, height=48, mask="auto")
 
-    # Caja ODC arriba derecha
     box_w, box_h = 210, 34
     box_x = PAGE_W - box_w - 24
     box_y = y0 + 34
@@ -182,11 +145,6 @@ def draw_header(c: canvas.Canvas, odc_num: str, logo: ImageReader) -> None:
 
 
 def draw_kv_block_left(c: canvas.Canvas, x: float, y_top: float, label: str, value: str) -> float:
-    """
-    Bloque tipo “ODC#, FECHA, PROVEEDOR...” como tu mock.
-    y_top = top baseline del renglón.
-    Regresa nuevo y_top abajo.
-    """
     font_sb = pick_font("Montserrat-SemiBold", "Helvetica-Bold")
     font_r = pick_font("Montserrat", "Helvetica")
 
@@ -195,21 +153,17 @@ def draw_kv_block_left(c: canvas.Canvas, x: float, y_top: float, label: str, val
     value_w = 95 * mm
     block_h = 26
 
-    # fondo suave en la parte de valor
     c.setFillColor(LIGHT_GRAY)
     c.rect(x + label_w, y_top - block_h + 4, value_w, block_h, stroke=0, fill=1)
 
-    # label
     c.setFillColor(SAP_BLUE)
     c.setFont(font_sb, 12)
     c.drawRightString(x + label_w - 6, y_top - row_h + 2, f"{label}:")
 
-    # value
     c.setFillColor(TEXT_DARK)
     c.setFont(font_r, 12)
     c.drawString(x + label_w + 8, y_top - row_h + 2, value)
 
-    # línea vertical separadora
     c.setStrokeColor(MID_GRAY)
     c.setLineWidth(1)
     c.line(x + label_w, y_top - block_h + 4, x + label_w, y_top + 4)
@@ -251,14 +205,7 @@ def build_items_table(items: List[Item]) -> Table:
 
     data = [["Concepto", "Precio unitario", "Unidades", "Subtotal"]]
     for it in items:
-        data.append(
-            [
-                it.concepto,
-                money_fmt(it.precio_unitario),
-                str(it.unidades),
-                money_fmt(it.subtotal),
-            ]
-        )
+        data.append([it.concepto, money_fmt(it.precio_unitario), str(it.unidades), money_fmt(it.subtotal)])
 
     col_widths = [110 * mm, 40 * mm, 30 * mm, 40 * mm]
     t = Table(data, colWidths=col_widths)
@@ -304,23 +251,23 @@ def draw_totals_box(c: canvas.Canvas, x: float, y_top: float, subtotal: float, a
     row_h = 14 * mm
     box_h = row_h * 3
 
-    # Left dark area
     c.setFillColor(SAP_BLUE_2)
     c.rect(x, y_top - box_h, box_w * 0.55, box_h, stroke=0, fill=1)
 
-    # Right white area
     c.setFillColor(colors.white)
     c.rect(x + box_w * 0.55, y_top - box_h, box_w * 0.45, box_h, stroke=1, fill=1)
 
-    # Row separators
     c.setStrokeColor(MID_GRAY)
     c.setLineWidth(1)
     c.line(x, y_top - row_h, x + box_w, y_top - row_h)
     c.line(x, y_top - row_h * 2, x + box_w, y_top - row_h * 2)
 
-    # Labels
     labels = ["Subtotal", "Anticipo", "Total"]
-    values = [money_fmt(subtotal), f"-{money_fmt(anticipo)}" if anticipo else money_fmt(0), money_fmt(total)]
+    values = [
+        money_fmt(subtotal),
+        f"-{money_fmt(anticipo)}" if anticipo else money_fmt(0),
+        money_fmt(total),
+    ]
 
     for i, (lab, val) in enumerate(zip(labels, values)):
         y = y_top - row_h * i - 10 * mm
@@ -345,23 +292,17 @@ def draw_footer_note(c: canvas.Canvas, text: str) -> None:
     c.drawCentredString(PAGE_W / 2, 18 * mm, text)
 
 
-def draw_conditions_page(
-    c: canvas.Canvas,
-    title: str,
-    sections: Optional[List[dict]],
-) -> None:
+def draw_conditions_page(c: canvas.Canvas, title: str, sections: Optional[List[dict]]) -> None:
     c.showPage()
 
     font_b = pick_font("Montserrat-Bold", "Helvetica-Bold")
     font_sb = pick_font("Montserrat-SemiBold", "Helvetica-Bold")
     font_r = pick_font("Montserrat", "Helvetica")
 
-    # Título centrado
     c.setFillColor(TEXT_DARK)
     c.setFont(font_b, 14)
     c.drawCentredString(PAGE_W / 2, PAGE_H - 25 * mm, title)
 
-    # Layout 2 columnas
     margin_x = 18 * mm
     top = PAGE_H - 40 * mm
     col_gap = 14 * mm
@@ -378,21 +319,19 @@ def draw_conditions_page(
         return
 
     def draw_section(x: float, y: float, sec: dict) -> float:
-        # título
         c.setFont(font_sb, 11)
         c.setFillColor(TEXT_DARK)
-        c.drawString(x, y, sec.get("titulo", "").strip())
+        c.drawString(x, y, (sec.get("titulo", "") or "").strip())
         y -= 8 * mm
 
         bullets = sec.get("bullets", []) or []
         c.setFont(font_r, 10.2)
+
         for b in bullets:
-            # bullet simple + wrap básico por ancho de columna
             text = (b or "").strip()
             if not text:
                 continue
 
-            # wrap naive por caracteres (suficiente para mock)
             max_chars = 78
             lines = []
             while len(text) > max_chars:
@@ -414,10 +353,8 @@ def draw_conditions_page(
         y -= 3 * mm
         return y
 
-    # Reparte secciones alternando columnas (izq/der)
     for idx, sec in enumerate(sections):
         if idx % 2 == 0:
-            # izquierda
             y_left = draw_section(x_left, y_left, sec)
             if y_left < 25 * mm:
                 c.showPage()
@@ -426,7 +363,6 @@ def draw_conditions_page(
                 y_left = top
                 y_right = top
         else:
-            # derecha
             y_right = draw_section(x_right, y_right, sec)
             if y_right < 25 * mm:
                 c.showPage()
@@ -438,21 +374,17 @@ def draw_conditions_page(
 
 def generate_pdf(payload: ODCRequest) -> bytes:
     register_fonts_if_present()
-
     logo = load_logo_from_url(DEFAULT_LOGO_URL)
 
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
 
-    # HEADER
     draw_header(c, payload.odc_num, logo)
 
-    # BODY TOP GRID
     left_x = 18 * mm
     right_x = 115 * mm + 18 * mm
-    y_top = PAGE_H - 105  # debajo del header
+    y_top = PAGE_H - 105
 
-    # Left KV block (ODC, fecha, proveedor, servicio, proyecto)
     y = y_top
     y = draw_kv_block_left(c, left_x, y, "ODC #", payload.odc_num)
     y = draw_kv_block_left(c, left_x, y, "FECHA", payload.fecha)
@@ -460,16 +392,13 @@ def generate_pdf(payload: ODCRequest) -> bytes:
     y = draw_kv_block_left(c, left_x, y, "SERVICIO", payload.servicio)
     y = draw_kv_block_left(c, left_x, y, "PROYECTO", payload.proyecto)
 
-    # Right “Facturar a”
     draw_facturar_a(c, right_x, y_top - 18, payload.facturar_a)
 
-    # TABLE
     table = build_items_table(payload.items)
     table_x = 18 * mm
     table_y_top = y - 10 * mm
     table_h = draw_table(c, table, table_x, table_y_top)
 
-    # Totals
     subtotal = sum([it.subtotal for it in payload.items])
     anticipo = safe_float(payload.anticipo)
 
@@ -477,19 +406,14 @@ def generate_pdf(payload: ODCRequest) -> bytes:
     totals_y_top = table_y_top - table_h - 10 * mm
     draw_totals_box(c, totals_x, totals_y_top, subtotal, anticipo)
 
-    # Footer note (ajusta a tu texto final)
     draw_footer_note(c, "Esta Orden de Compra constituye el acuerdo formal para la prestación del servicio descrito.")
 
-    # PAGE 2: Condiciones
     draw_conditions_page(c, payload.condiciones_titulo, payload.condiciones)
 
     c.save()
     return buf.getvalue()
 
 
-# -----------------------------
-# FastAPI
-# -----------------------------
 app = FastAPI(title="ODCs PDF Generator", version="1.0.0")
 
 
@@ -501,10 +425,6 @@ def health():
 @app.post("/generate-odc")
 def generate_odc(payload: ODCRequest):
     pdf_bytes = generate_pdf(payload)
-
     filename = f"ODC-{payload.odc_num}.pdf".replace(" ", "_")
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"'
-    }
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
-```

@@ -1,16 +1,17 @@
 # main.py
 # ODCs - Render + FastAPI (Excel only)
-# Engine: XlsxWriter (stable merges + precise layout)
+# Engine: XlsxWriter (stable layout + controlled merges)
 #
 # IMPORTANT:
-# - TOTAL comes from Monday -> it MUST be present in JSON as a number (float/int).
+# - TOTAL comes from Monday -> MUST be present in JSON as a number.
 # - Logo comes from URL (PNG recommended). Default is the Sapience white logo you provided.
 #
-# requirements.txt must include:
+# requirements.txt must include (you already have it):
 #   fastapi==0.110.3
 #   uvicorn==0.29.0
 #   pydantic==2.7.4
 #   XlsxWriter==3.2.0
+#   requests==2.32.3
 #
 # Endpoints:
 #   GET  /health
@@ -23,13 +24,13 @@ from typing import List, Optional
 from datetime import datetime
 from io import BytesIO
 import struct
-import urllib.request
+import requests
 
 import xlsxwriter
 from xlsxwriter.utility import xl_range
 
 
-app = FastAPI(title="Sapience ODCs (Excel)", version="1.0.1")
+app = FastAPI(title="Sapience ODCs (Excel)", version="1.0.2")
 
 
 # -------------------- MODELOS --------------------
@@ -41,7 +42,7 @@ class ODCItem(BaseModel):
 
 class ODCPayload(BaseModel):
     odc_number: str
-    issue_date: str  # keep string (e.g., "15 Ene 2026")
+    issue_date: str
     supplier: str
     service: str
     project: str
@@ -62,7 +63,6 @@ class ODCPayload(BaseModel):
 
 # -------------------- UTILIDADES --------------------
 def _png_size(img_bytes: bytes):
-    # Returns (w,h) if valid PNG
     if len(img_bytes) < 24 or img_bytes[:8] != b"\x89PNG\r\n\x1a\n":
         return None
     try:
@@ -74,7 +74,6 @@ def _png_size(img_bytes: bytes):
 
 
 def excel_col_width_to_pixels(w: float) -> int:
-    # Standard approximation
     if w < 1.0:
         return int(w * 12 + 0.5)
     return int(w * 7 + 5 + 0.5)
@@ -89,7 +88,7 @@ def r0(row_1based: int) -> int:
 
 
 def range_a1(row1: int, col1: int, row2: int, col2: int) -> str:
-    # row/col are 1-based, col1=1 => A
+    # row/col are 1-based; col1=1 => A
     return xl_range(r0(row1), col1 - 1, r0(row2), col2 - 1)
 
 
@@ -126,7 +125,7 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
     wb = xlsxwriter.Workbook(output, {"in_memory": True})
     ws = wb.add_worksheet("ODC")
 
-    # -------------------- PALETA + TIPOGRAFIA --------------------
+    # -------- PALETA + FUENTE --------
     TEAL = "#0F3C4B"
     TEAL_2 = "#0F4B5A"
     LIGHT = "#EFEFEF"
@@ -134,17 +133,14 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
     BLACK = "#111111"
     BORDER = "#6F6F6F"
     RED = "#E00000"
-
-    # NOTE: Excel will fall back if Montserrat isn't installed on the viewer machine
     FONT = "Montserrat"
 
-    # -------------------- GRID (B..Z width = 2.5) --------------------
+    # -------- GRID (B..Z = 2.5) --------
     ws.set_column(0, 0, 1.2)  # A margin
-    for c in range(1, 26):    # B..Z (0-based)
+    for c in range(1, 26):    # B..Z
         ws.set_column(c, c, 2.5)
 
-    # Semantic splits (1-based col indices)
-    # B=2 ... Z=26
+    # 1-based columns:
     SPLITS = {
         "concept": (2, 14),    # B:N
         "unit": (15, 19),      # O:S
@@ -152,12 +148,12 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
         "subtotal": (23, 26),  # W:Z
     }
 
-    # -------------------- FORMATOS (font -1pt vs previous) --------------------
+    # -------- FILLS --------
     teal_fill = wb.add_format({"bg_color": TEAL})
     white_fill = wb.add_format({"bg_color": WHITE})
     light_fill = wb.add_format({"bg_color": LIGHT})
 
-    # Left meta rows (zebra)
+    # -------- META LEFT (font 8) --------
     label_g = wb.add_format({
         "font_name": FONT, "font_size": 8, "bold": True,
         "font_color": TEAL_2, "align": "right", "valign": "vcenter",
@@ -178,11 +174,10 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
         "font_color": BLACK, "align": "left", "valign": "vcenter",
         "bg_color": WHITE, "text_wrap": True
     })
-
     divider_g = wb.add_format({"right": 1, "right_color": BORDER, "bg_color": LIGHT})
     divider_w = wb.add_format({"right": 1, "right_color": BORDER, "bg_color": WHITE})
 
-    # Bill to block (ensure REAL white background)
+    # -------- FACTURAR A (white real) --------
     facturar_fmt = wb.add_format({
         "font_name": FONT, "font_size": 13, "bold": True,
         "font_color": TEAL_2, "align": "center", "valign": "vcenter",
@@ -199,7 +194,7 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
         "bg_color": WHITE
     })
 
-    # ODC box in banner
+    # -------- ODC BOX --------
     odc_box = wb.add_format({
         "font_name": FONT, "font_size": 11, "bold": True,
         "align": "center", "valign": "vcenter",
@@ -215,7 +210,7 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
         "border": 1, "border_color": BORDER
     })
 
-    # Table header
+    # -------- TABLE HEADER --------
     th = wb.add_format({
         "font_name": FONT, "font_size": 9, "bold": True,
         "font_color": WHITE,
@@ -224,57 +219,48 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
         "border": 1, "border_color": BORDER
     })
 
-    # Table body (force bg_color WHITE / LIGHT)
+    # -------- TABLE BODY --------
     td_left_w = wb.add_format({
         "font_name": FONT, "font_size": 8,
-        "font_color": BLACK,
-        "align": "left", "valign": "vcenter",
-        "text_wrap": True,
-        "bg_color": WHITE,
+        "font_color": BLACK, "align": "left", "valign": "vcenter",
+        "text_wrap": True, "bg_color": WHITE,
         "border": 1, "border_color": BORDER
     })
     td_left_g = wb.add_format({
         "font_name": FONT, "font_size": 8,
-        "font_color": BLACK,
-        "align": "left", "valign": "vcenter",
-        "text_wrap": True,
-        "bg_color": LIGHT,
+        "font_color": BLACK, "align": "left", "valign": "vcenter",
+        "text_wrap": True, "bg_color": LIGHT,
         "border": 1, "border_color": BORDER
     })
     td_c_w = wb.add_format({
         "font_name": FONT, "font_size": 8,
-        "font_color": BLACK,
-        "align": "center", "valign": "vcenter",
+        "font_color": BLACK, "align": "center", "valign": "vcenter",
         "bg_color": WHITE,
         "border": 1, "border_color": BORDER
     })
     td_c_g = wb.add_format({
         "font_name": FONT, "font_size": 8,
-        "font_color": BLACK,
-        "align": "center", "valign": "vcenter",
+        "font_color": BLACK, "align": "center", "valign": "vcenter",
         "bg_color": LIGHT,
         "border": 1, "border_color": BORDER
     })
 
-    # Currency formats use symbol from payload (must be created after payload is available)
     money_fmt_w = wb.add_format({
         "font_name": FONT, "font_size": 8,
-        "font_color": BLACK,
-        "align": "center", "valign": "vcenter",
+        "font_color": BLACK, "align": "center", "valign": "vcenter",
         "bg_color": WHITE,
         "border": 1, "border_color": BORDER,
         "num_format": f'"{payload.currency_symbol}"#,##0'
     })
     money_fmt_g = wb.add_format({
         "font_name": FONT, "font_size": 8,
-        "font_color": BLACK,
-        "align": "center", "valign": "vcenter",
+        "font_color": BLACK, "align": "center", "valign": "vcenter",
         "bg_color": LIGHT,
         "border": 1, "border_color": BORDER,
         "num_format": f'"{payload.currency_symbol}"#,##0'
     })
 
-    # TOTAL (suelto, como mockup)
+    # -------- TOTAL (suelto) --------
     total_label_fmt = wb.add_format({
         "font_name": FONT, "font_size": 16, "bold": True,
         "align": "right", "valign": "vcenter",
@@ -289,44 +275,37 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
         "num_format": f'"{payload.currency_symbol}"#,##0.00'
     })
 
-    # -------------------- ALTURAS BASE --------------------
-    # Banner rows (2..4)
+    # -------- ROW HEIGHTS --------
     ws.set_row(r0(1), 6)
     ws.set_row(r0(2), 38)
     ws.set_row(r0(3), 38)
     ws.set_row(r0(4), 22)
-
-    # Meta block rows 5..9
     for rr in range(5, 10):
         ws.set_row(r0(rr), 24)
-
-    # Spacer + header
     ws.set_row(r0(10), 14)
     ws.set_row(r0(11), 34)
 
-    # Items (a little taller so text doesn't feel tight)
-    row_h_items = 27  # tweak here
+    row_h_items = 27
 
-    # -------------------- BANNER (fill only, no big merges) --------------------
+    # -------- BANNER FILL (no big merges) --------
     ws.conditional_format(range_a1(2, 2, 4, 26), {"type": "no_blanks", "format": teal_fill})
     ws.conditional_format(range_a1(2, 2, 4, 26), {"type": "blanks", "format": teal_fill})
 
-    # ODC mini box inside banner
-    ws.merge_range(range_a1(3, 20, 3, 23), "ODC #:", odc_box)                # T3:W3
-    ws.merge_range(range_a1(3, 24, 3, 26), payload.odc_number, odc_num)      # X3:Z3
+    # ODC mini box in banner (small merges are OK)
+    ws.merge_range(range_a1(3, 20, 3, 23), "ODC #:", odc_box)           # T3:W3
+    ws.merge_range(range_a1(3, 24, 3, 26), payload.odc_number, odc_num) # X3:Z3
 
-    # -------------------- LOGO (smaller + centered vertically) --------------------
+    # -------- LOGO --------
     if payload.logo_url:
         try:
-            with urllib.request.urlopen(payload.logo_url, timeout=12) as resp:
-                img = resp.read()
+            resp = requests.get(payload.logo_url, timeout=12)
+            resp.raise_for_status()
+            img = resp.content
 
             wh = _png_size(img)
-            # Target area for logo: B2:N4
-            col_w = 2.5
-            target_px_w = sum(excel_col_width_to_pixels(col_w) for _ in range(2, 15))  # B..N
-            banner_h_pt = float(38 + 38 + 22)
-            target_px_h = points_to_pixels(banner_h_pt)
+            # target: B2:N4
+            target_px_w = sum(excel_col_width_to_pixels(2.5) for _ in range(2, 15))  # B..N
+            target_px_h = points_to_pixels(float(38 + 38 + 22))
 
             x_scale = y_scale = 1.0
             y_off = 0
@@ -334,14 +313,13 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
                 w_px, h_px = wh
                 scale = min(target_px_w / w_px, target_px_h / h_px)
                 scale = max(0.05, min(scale, 3.0))
-                scale *= 0.86  # smaller per your note
+                scale *= 0.86  # smaller
                 x_scale = y_scale = scale
                 scaled_h = h_px * y_scale
                 y_off = max(0, int((target_px_h - scaled_h) / 2))
 
-            # Insert at B2
             ws.insert_image(
-                r0(2), 1, "sapience_logo.png",
+                r0(2), 1, "sapience_logo.png",  # B2
                 {
                     "image_data": BytesIO(img),
                     "x_scale": x_scale,
@@ -352,11 +330,9 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
                 },
             )
         except Exception:
-            # Keep going even if logo fails
             pass
 
-    # -------------------- BLOQUE IZQUIERDO (B..O) --------------------
-    # label B:E, divider in E, value F:O
+    # -------- LEFT META BLOCK --------
     left_rows = [
         ("ODC #", payload.odc_number),
         ("FECHA:", payload.issue_date),
@@ -367,22 +343,20 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
 
     for i, (lab, val) in enumerate(left_rows):
         rr = 5 + i
-        is_grey = (i % 2 == 0)  # rows 5,7,9 grey
+        is_grey = (i % 2 == 0)  # 5,7,9 grey
         base_fill = light_fill if is_grey else white_fill
         lab_fmt = label_g if is_grey else label_w
         val_fmt = value_g if is_grey else value_w
         div_fmt = divider_g if is_grey else divider_w
 
-        # Force background (avoid "transparent")
         ws.conditional_format(range_a1(rr, 2, rr, 15), {"type": "blanks", "format": base_fill})
         ws.conditional_format(range_a1(rr, 2, rr, 15), {"type": "no_blanks", "format": base_fill})
 
-        ws.merge_range(range_a1(rr, 2, rr, 5), lab, lab_fmt)     # B:E
-        ws.write(r0(rr), 4, "", div_fmt)                          # E divider overlay
-        ws.merge_range(range_a1(rr, 6, rr, 15), val, val_fmt)     # F:O
+        ws.merge_range(range_a1(rr, 2, rr, 5), lab, lab_fmt)   # B:E
+        ws.write(r0(rr), 4, "", div_fmt)                       # E divider
+        ws.merge_range(range_a1(rr, 6, rr, 15), val, val_fmt)  # F:O
 
-    # -------------------- BLOQUE DERECHO (FACTURAR A) Q..Z --------------------
-    # Q=17 ... Z=26
+    # -------- BILL TO BLOCK (Q..Z) --------
     ws.conditional_format(range_a1(5, 17, 9, 26), {"type": "blanks", "format": white_fill})
     ws.conditional_format(range_a1(5, 17, 9, 26), {"type": "no_blanks", "format": white_fill})
 
@@ -392,21 +366,20 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
     ws.merge_range(range_a1(8, 17, 8, 26), payload.bill_to_address_1, bill)
     ws.merge_range(range_a1(9, 17, 9, 26), payload.bill_to_address_2, bill)
 
-    # -------------------- HEADER TABLA (row 11) --------------------
+    # -------- TABLE HEADER --------
     ws.merge_range(range_a1(11, SPLITS["concept"][0], 11, SPLITS["concept"][1]), "Concepto", th)
     ws.merge_range(range_a1(11, SPLITS["unit"][0], 11, SPLITS["unit"][1]), "Costo unitario", th)
     ws.merge_range(range_a1(11, SPLITS["units"][0], 11, SPLITS["units"][1]), "Unidades", th)
     ws.merge_range(range_a1(11, SPLITS["subtotal"][0], 11, SPLITS["subtotal"][1]), "Subtotal", th)
 
-    # -------------------- ITEMS (row 12+) --------------------
+    # -------- ITEMS --------
     items = payload.items or []
-    start_row = 12
-    max_rows = 12  # safety
-    last_item_row = start_row - 1
-
-    # If no items, still render one blank row
     if not items:
         items = [ODCItem(concept="", unit_cost=0, units=0)]
+
+    start_row = 12
+    max_rows = 12
+    last_item_row = start_row - 1
 
     for idx, it in enumerate(items[:max_rows]):
         rr = start_row + idx
@@ -418,7 +391,6 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
         center_fmt = td_c_g if zebra_grey else td_c_w
         money_fmt = money_fmt_g if zebra_grey else money_fmt_w
 
-        # Force row background (prevents "transparent white")
         ws.conditional_format(range_a1(rr, 2, rr, 26), {"type": "blanks", "format": row_fill})
         ws.conditional_format(range_a1(rr, 2, rr, 26), {"type": "no_blanks", "format": row_fill})
 
@@ -433,20 +405,15 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
 
         last_item_row = rr
 
-    # -------------------- TOTAL (FROM PAYLOAD) --------------------
+    # -------- TOTAL ROW (FROM PAYLOAD) --------
     gap_rows = 2
     total_row = last_item_row + gap_rows
     ws.set_row(r0(total_row), 34)
 
-    # Force white background in total row
     ws.conditional_format(range_a1(total_row, 2, total_row, 26), {"type": "blanks", "format": white_fill})
     ws.conditional_format(range_a1(total_row, 2, total_row, 26), {"type": "no_blanks", "format": white_fill})
 
-    ws.merge_range(
-        range_a1(total_row, SPLITS["units"][0], total_row, SPLITS["units"][1]),
-        "TOTAL:",
-        total_label_fmt
-    )
+    ws.merge_range(range_a1(total_row, SPLITS["units"][0], total_row, SPLITS["units"][1]), "TOTAL:", total_label_fmt)
     ws.merge_range(
         range_a1(total_row, SPLITS["subtotal"][0], total_row, SPLITS["subtotal"][1]),
         safe_float(payload.total),
@@ -455,12 +422,12 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
 
     last_row = total_row
 
-    # -------------------- PRINT SETTINGS --------------------
+    # -------- PRINT SETTINGS (XlsxWriter API) --------
     ws.set_landscape()
     ws.set_paper(9)  # A4
     ws.set_margins(left=0.25, right=0.25, top=0.35, bottom=0.35)
     ws.fit_to_pages(1, 0)
-    ws.set_print_area(r0(1), 0, r0(last_row), 25)  # A1..Z(last_row)
+    ws.print_area(range_a1(1, 1, last_row, 26))  # A1:Z(last_row)
 
     wb.close()
     return output.getvalue()

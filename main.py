@@ -1,17 +1,19 @@
 # main.py
-# ODCs - Excel only (NO big merges; banner is just fill; small functional merges allowed)
-# Render + FastAPI + xlsxwriter
+# ODCs - Excel only (Render + FastAPI)
+# Engine: XlsxWriter (stable for merges; no openpyxl merged-cell read-only issues)
 #
 # Endpoints:
 #   GET  /health
 #   POST /generate-odc-excel
 #
-# Key ideas:
-# - Grid of equal-width columns (2.5) and controlled row heights.
-# - Banner = fill only + logo image from URL (no merge).
-# - ODC small box = pseudo-merge via "center across selection" (xlsxwriter) + fill.
-# - Table headers/body use the same "span" helper (write in left cell + blank fill across range),
-#   but we DO NOT write values into the other cells (only blanks), which is safe in xlsxwriter.
+# Layout rules:
+# - Uniform grid: all columns B..Z have the same width (2.5)
+# - Banner = fill only (no merge)
+# - Small, functional merges:
+#     * ODC box in banner (T:W and X:Z)
+#     * Left meta rows: label B:E + value F:O (per row)
+#     * Table header + each item row:
+#         Concept B:N | Unit O:S | Units T:V | Subtotal W:Z
 #
 # Dependencies (requirements.txt):
 #   fastapi==0.110.3
@@ -31,7 +33,7 @@ import struct
 import requests
 import xlsxwriter
 
-app = FastAPI(title="ODCs Render (Excel Only)", version="1.1.0")
+app = FastAPI(title="ODCs Render (Excel Only)", version="1.2.0")
 
 
 # ----------------- MODELOS -----------------
@@ -56,7 +58,7 @@ class ODCRequest(BaseModel):
 
     items: List[ODCItem] = Field(default_factory=list)
 
-    # Logo for banner (PNG recommended)
+    # PNG recommended
     logo_url: Optional[str] = None
 
 
@@ -73,7 +75,6 @@ def _png_size(img_bytes: bytes):
 
 
 def excel_col_width_to_pixels(w: float) -> int:
-    # same as your calendar best practice
     if w < 1.0:
         return int(w * 12 + 0.5)
     return int(w * 7 + 5 + 0.5)
@@ -83,7 +84,7 @@ def points_to_pixels(pt: float) -> float:
     return pt * 4 / 3
 
 
-# ----------------- LAYOUT SPEC (ajusta aquí) -----------------
+# ----------------- LAYOUT (ajusta aquí) -----------------
 LAYOUT = {
     "grid": {"col_start": "B", "col_end": "Z", "col_width": 2.5, "rows": 120, "base_row_h": 18},
 
@@ -91,10 +92,9 @@ LAYOUT = {
     "banner": {"r1": 2, "c1": "B", "r2": 4, "c2": "Z", "row_heights": {2: 26, 3: 26, 4: 22}},
 
     # ODC box (top-right) at row 3
-    # label block T..W, value block X..Z
     "odc_box": {"row": 3, "label": ("T", "W"), "value": ("X", "Z")},
 
-    # Left meta block rows 5..9: labels B..E, values F..O, with divider at E
+    # Left meta block rows 5..9: labels B..E, values F..O, divider after E
     "left": {
         "label_cols": ("B", "E"),
         "value_cols": ("F", "O"),
@@ -104,13 +104,14 @@ LAYOUT = {
     },
 
     # Right "FACTURAR A" block starts at Q
-    "bill_to": {"title_row": 5, "cols": ("Q", "Z"), "lines": {6: "name", 7: "rfc", 8: "a1", 9: "a2"}},
+    "bill_to": {"title_row": 5, "cols": ("Q", "Z")},
 
     # Items table
     "items": {
         "header_row": 11,
         "header_height": 28,
         "start_row": 12,
+        "max_rows": 20,  # safety
         "zebra_gray_on_odd_rows": True,
         # Concept B..N | Unit O..S | Units T..V | Subtotal W..Z
         "splits": {
@@ -119,10 +120,11 @@ LAYOUT = {
             "units": ("T", "V"),
             "subtotal": ("W", "Z"),
         },
+        "row_height": 22,
     },
 
-    # Logo placement over banner (anchor cell + how many grid columns to approximate max width)
-    "logo": {"anchor": ("B", 2), "cols_for_logo": 12, "x_offset": 10, "y_offset": 8},
+    # Logo placement over banner
+    "logo": {"anchor_col": "B", "anchor_row": 2, "cols_for_logo": 12, "x_offset": 10, "y_offset": 8},
 }
 
 
@@ -159,106 +161,117 @@ def build_odc_excel(payload: ODCRequest) -> bytes:
     GRAY = "#EFEFEF"
     BLACK = "#000000"
     RED = "#D50000"
-    BORDER = "#6E6E6E"
-    FONT = "Calibri"
+    BORDER = "#7A7A7A"
 
-    # ---- Formats (explícitos, sin .properties) ----
+    # NOTA: Montserrat solo se verá si el usuario tiene esa fuente instalada.
+    # En server se genera el xlsx, pero el render final depende del Excel del usuario.
+    FONT = "Montserrat"
+
+    # ---- Formats (9pt base) ----
     white_fmt = wb.add_format({"bg_color": WHITE})
 
     banner_bg = wb.add_format({"bg_color": TEAL})
 
-    # Box
+    # ODC box
     box_bg = wb.add_format({"bg_color": GRAY, "border": 1, "border_color": BORDER})
     box_label = wb.add_format({
-        "font_name": FONT, "font_size": 16, "bold": True,
+        "font_name": FONT, "font_size": 11, "bold": True,
         "font_color": TEAL_2, "bg_color": GRAY,
         "border": 1, "border_color": BORDER,
         "align": "center", "valign": "vcenter",
-        "text_h_align": 6,  # center_across (xlsxwriter internal)
     })
     box_value = wb.add_format({
-        "font_name": FONT, "font_size": 18, "bold": True,
+        "font_name": FONT, "font_size": 12, "bold": True,
         "font_color": RED, "bg_color": GRAY,
         "border": 1, "border_color": BORDER,
         "align": "center", "valign": "vcenter",
-        "text_h_align": 6,  # center_across
     })
 
-    label = wb.add_format({
-        "font_name": FONT, "font_size": 14, "bold": True,
-        "font_color": TEAL_2, "align": "right", "valign": "vcenter"
+    # Left meta
+    label_w = wb.add_format({
+        "font_name": FONT, "font_size": 9, "bold": True,
+        "font_color": TEAL_2, "align": "right", "valign": "vcenter",
+        "bg_color": WHITE
     })
-    value = wb.add_format({
-        "font_name": FONT, "font_size": 16,
-        "font_color": BLACK, "align": "left", "valign": "vcenter"
+    value_w = wb.add_format({
+        "font_name": FONT, "font_size": 9,
+        "font_color": BLACK, "align": "left", "valign": "vcenter",
+        "bg_color": WHITE, "text_wrap": True
     })
     label_g = wb.add_format({
-        "font_name": FONT, "font_size": 14, "bold": True,
+        "font_name": FONT, "font_size": 9, "bold": True,
         "font_color": TEAL_2, "align": "right", "valign": "vcenter",
         "bg_color": GRAY
     })
     value_g = wb.add_format({
-        "font_name": FONT, "font_size": 16,
+        "font_name": FONT, "font_size": 9,
         "font_color": BLACK, "align": "left", "valign": "vcenter",
-        "bg_color": GRAY
+        "bg_color": GRAY, "text_wrap": True
     })
 
-    # Divider (right border only) on E
     div_w = wb.add_format({"bg_color": WHITE, "right": 1, "right_color": BORDER})
     div_g = wb.add_format({"bg_color": GRAY, "right": 1, "right_color": BORDER})
 
+    # Bill to
     facturar = wb.add_format({
-        "font_name": FONT, "font_size": 22, "bold": True,
+        "font_name": FONT, "font_size": 14, "bold": True,
         "font_color": TEAL_2, "align": "center", "valign": "vcenter"
     })
     bill_bold = wb.add_format({
-        "font_name": FONT, "font_size": 16, "bold": True,
+        "font_name": FONT, "font_size": 10, "bold": True,
         "font_color": BLACK, "align": "left", "valign": "vcenter"
     })
     bill = wb.add_format({
-        "font_name": FONT, "font_size": 16,
+        "font_name": FONT, "font_size": 10,
         "font_color": BLACK, "align": "left", "valign": "vcenter"
     })
 
+    # Table header
     th = wb.add_format({
-        "font_name": FONT, "font_size": 16, "bold": True,
+        "font_name": FONT, "font_size": 10, "bold": True,
         "font_color": WHITE, "bg_color": TEAL_2,
         "border": 1, "border_color": BORDER,
         "align": "center", "valign": "vcenter",
-        "text_h_align": 6,  # center_across (makes header behave like merged)
     })
 
+    # Table body
     td_left = wb.add_format({
-        "font_name": FONT, "font_size": 16, "font_color": BLACK,
+        "font_name": FONT, "font_size": 9,
+        "font_color": BLACK,
         "border": 1, "border_color": BORDER,
         "align": "left", "valign": "vcenter",
         "text_wrap": True
     })
     td_left_g = wb.add_format({
-        "font_name": FONT, "font_size": 16, "font_color": BLACK,
+        "font_name": FONT, "font_size": 9,
+        "font_color": BLACK,
         "border": 1, "border_color": BORDER,
         "align": "left", "valign": "vcenter",
         "text_wrap": True, "bg_color": GRAY
     })
     td_c = wb.add_format({
-        "font_name": FONT, "font_size": 16, "font_color": BLACK,
+        "font_name": FONT, "font_size": 9,
+        "font_color": BLACK,
         "border": 1, "border_color": BORDER,
         "align": "center", "valign": "vcenter"
     })
     td_c_g = wb.add_format({
-        "font_name": FONT, "font_size": 16, "font_color": BLACK,
+        "font_name": FONT, "font_size": 9,
+        "font_color": BLACK,
         "border": 1, "border_color": BORDER,
         "align": "center", "valign": "vcenter",
         "bg_color": GRAY
     })
     money = wb.add_format({
-        "font_name": FONT, "font_size": 16, "font_color": BLACK,
+        "font_name": FONT, "font_size": 9,
+        "font_color": BLACK,
         "border": 1, "border_color": BORDER,
         "align": "center", "valign": "vcenter",
         "num_format": '"$"#,##0'
     })
     money_g = wb.add_format({
-        "font_name": FONT, "font_size": 16, "font_color": BLACK,
+        "font_name": FONT, "font_size": 9,
+        "font_color": BLACK,
         "border": 1, "border_color": BORDER,
         "align": "center", "valign": "vcenter",
         "bg_color": GRAY,
@@ -272,28 +285,34 @@ def build_odc_excel(payload: ODCRequest) -> bytes:
     def c0(col_letter: str) -> int:
         return ord(col_letter.upper()) - ord("A")
 
+    def a1(row_1based: int, col_letter: str) -> str:
+        return f"{col_letter.upper()}{row_1based}"
+
+    def range_a1(r1: int, c1: str, r2: int, c2: str) -> str:
+        return f"{c1.upper()}{r1}:{c2.upper()}{r2}"
+
     def fill_range(row1: int, col1: str, row2: int, col2: str, fmt) -> None:
-        """Paint range with blanks (safe in xlsxwriter)."""
+        """Paint range with blanks (safe and fast)."""
         for rr in range(r0(row1), r0(row2) + 1):
             for cc in range(c0(col1), c0(col2) + 1):
                 ws.write_blank(rr, cc, None, fmt)
 
-    def span_write(row: int, col_start: str, col_end: str, text, fmt) -> None:
-        """Write text in left cell + paint blanks to the right (visual span, no merges)."""
-        rr = r0(row)
-        cs, ce = c0(col_start), c0(col_end)
-        ws.write(rr, cs, text, fmt)
-        for cc in range(cs + 1, ce + 1):
-            ws.write_blank(rr, cc, None, fmt)
+    def merge_write_row(row_1based: int, col_start: str, col_end: str, text, fmt) -> None:
+        """Merge a single row range and write text (top-left is where xlsxwriter writes)."""
+        ws.merge_range(range_a1(row_1based, col_start, row_1based, col_end), text, fmt)
 
     # ----------------- Grid setup -----------------
+    gs = LAYOUT["grid"]
+
     # global white background
     for c in range(0, 70):
         ws.set_column(c, c, None, white_fmt)
 
-    gs = LAYOUT["grid"]
+    # Uniform widths B..Z
     for c in range(c0(gs["col_start"]), c0(gs["col_end"]) + 1):
         ws.set_column(c, c, gs["col_width"], white_fmt)
+
+    # Base row heights
     for r in range(0, gs["rows"]):
         ws.set_row(r, gs["base_row_h"])
 
@@ -301,7 +320,6 @@ def build_odc_excel(payload: ODCRequest) -> bytes:
     b = LAYOUT["banner"]
     for rr, hh in b["row_heights"].items():
         ws.set_row(r0(rr), hh)
-
     fill_range(b["r1"], b["c1"], b["r2"], b["c2"], banner_bg)
 
     # ----------------- Logo over banner -----------------
@@ -311,8 +329,8 @@ def build_odc_excel(payload: ODCRequest) -> bytes:
             img = r.content
             wh = _png_size(img)
 
-            # anchor
-            anchor_col, anchor_row_1based = LAYOUT["logo"]["anchor"][0], LAYOUT["logo"]["anchor"][1]
+            anchor_col = LAYOUT["logo"]["anchor_col"]
+            anchor_row_1based = int(LAYOUT["logo"]["anchor_row"])
             anchor_row = r0(anchor_row_1based)
             anchor_col0 = c0(anchor_col)
 
@@ -336,74 +354,115 @@ def build_odc_excel(payload: ODCRequest) -> bytes:
                     "y_scale": y_scale,
                     "x_offset": int(LAYOUT["logo"]["x_offset"]),
                     "y_offset": int(LAYOUT["logo"]["y_offset"]),
-                    "object_position": 1
+                    "object_position": 1,
                 }
             )
         except Exception:
+            # Keep running even if image fails
             pass
 
-    # ----------------- ODC small box (top-right) -----------------
+    # ----------------- ODC box (top-right) -----------------
     ob = LAYOUT["odc_box"]
+    # Fill box area
     fill_range(ob["row"], ob["label"][0], ob["row"], ob["value"][1], box_bg)
-    span_write(ob["row"], ob["label"][0], ob["label"][1], "ODC #:", box_label)
-    span_write(ob["row"], ob["value"][0], ob["value"][1], payload.odc_number, box_value)
+    # Merge label and value
+    merge_write_row(ob["row"], ob["label"][0], ob["label"][1], "ODC #:", box_label)
+    merge_write_row(ob["row"], ob["value"][0], ob["value"][1], payload.odc_number, box_value)
 
-    # ----------------- Left meta block -----------------
+    # ----------------- Left meta block (B..O) -----------------
     lb = LAYOUT["left"]
     rmap = lb["rows"]
+
+    # Row heights for meta (tune)
+    ws.set_row(r0(5), 22)
+    ws.set_row(r0(6), 22)
+    ws.set_row(r0(7), 22)
+    ws.set_row(r0(8), 22)
+    ws.set_row(r0(9), 22)
+
     for rr in rmap.values():
         is_gray = rr in lb["zebra_rows"]
-        bg = wb.add_format({"bg_color": GRAY if is_gray else WHITE})
-        fill_range(rr, lb["label_cols"][0], rr, lb["value_cols"][1], bg)
-        # divider at E
+        bg_fmt = wb.add_format({"bg_color": GRAY if is_gray else WHITE})
+        fill_range(rr, lb["label_cols"][0], rr, lb["value_cols"][1], bg_fmt)
+        # Divider after E
         ws.write_blank(r0(rr), c0(lb["divider_col"]), None, div_g if is_gray else div_w)
 
-    pairs = [
+    # Merge labels and values (this prevents text overflow into bill_to area)
+    meta_rows = [
         ("ODC #", payload.odc_number, rmap["odc"]),
         ("FECHA:", payload.issue_date or "", rmap["fecha"]),
         ("PROVEEDOR:", payload.supplier, rmap["proveedor"]),
         ("SERVICIO:", payload.service, rmap["servicio"]),
         ("PROYECTO:", payload.project, rmap["proyecto"]),
     ]
-    for lab, val, rr in pairs:
-        span_write(rr, lb["label_cols"][0], lb["label_cols"][1], lab, label_g if rr in lb["zebra_rows"] else label)
-        span_write(rr, lb["value_cols"][0], lb["value_cols"][1], val, value_g if rr in lb["zebra_rows"] else value)
+    for lab, val, rr in meta_rows:
+        is_gray = rr in lb["zebra_rows"]
+        merge_write_row(rr, lb["label_cols"][0], lb["label_cols"][1], lab, label_g if is_gray else label_w)
+        merge_write_row(rr, lb["value_cols"][0], lb["value_cols"][1], val, value_g if is_gray else value_w)
 
     # ----------------- Bill to block -----------------
     bt = LAYOUT["bill_to"]
-    span_write(bt["title_row"], bt["cols"][0], bt["cols"][1], "FACTURAR A:", facturar)
-    ws.write(r0(6), c0(bt["cols"][0]), payload.bill_to_name, bill_bold)
-    ws.write(r0(7), c0(bt["cols"][0]), f"RFC: {payload.bill_to_rfc}", bill_bold)
-    ws.write(r0(8), c0(bt["cols"][0]), payload.bill_to_address_1, bill)
-    ws.write(r0(9), c0(bt["cols"][0]), payload.bill_to_address_2, bill)
+    # Title centered in Q..Z
+    merge_write_row(bt["title_row"], bt["cols"][0], bt["cols"][1], "FACTURAR A:", facturar)
+
+    # Lines (plain write in Q col; they won't overflow much because there is content to the right)
+    q_col = bt["cols"][0]
+    ws.set_row(r0(6), 20)
+    ws.set_row(r0(7), 20)
+    ws.set_row(r0(8), 20)
+    ws.set_row(r0(9), 20)
+
+    ws.write(r0(6), c0(q_col), payload.bill_to_name, bill_bold)
+    ws.write(r0(7), c0(q_col), f"RFC: {payload.bill_to_rfc}", bill_bold)
+    ws.write(r0(8), c0(q_col), payload.bill_to_address_1, bill)
+    ws.write(r0(9), c0(q_col), payload.bill_to_address_2, bill)
 
     # ----------------- Items table -----------------
     it = LAYOUT["items"]
+    s = it["splits"]
+
+    # Blank row 10 spacing
+    ws.set_row(r0(10), 10)
+
+    # Header row 11
     ws.set_row(r0(it["header_row"]), it["header_height"])
     fill_range(it["header_row"], gs["col_start"], it["header_row"], gs["col_end"], th)
 
-    s = it["splits"]
-    span_write(it["header_row"], s["concept"][0], s["concept"][1], "Concepto", th)
-    span_write(it["header_row"], s["unit_cost"][0], s["unit_cost"][1], "Costo unitario", th)
-    span_write(it["header_row"], s["units"][0], s["units"][1], "Unidades", th)
-    span_write(it["header_row"], s["subtotal"][0], s["subtotal"][1], "Subtotal", th)
+    merge_write_row(it["header_row"], s["concept"][0], s["concept"][1], "Concepto", th)
+    merge_write_row(it["header_row"], s["unit_cost"][0], s["unit_cost"][1], "Costo unitario", th)
+    merge_write_row(it["header_row"], s["units"][0], s["units"][1], "Unidades", th)
+    merge_write_row(it["header_row"], s["subtotal"][0], s["subtotal"][1], "Subtotal", th)
 
+    # Data rows
     start = it["start_row"]
-    items = payload.items or [ODCItem()]
-    row = start
+    items = payload.items or []
+    # Keep at least 1 row visible (even if no items)
+    if not items:
+        items = [ODCItem(concept="", unit_cost=0, units=0)]
 
-    for item in items:
-        gray = (row % 2 == 1) if it["zebra_gray_on_odd_rows"] else (row % 2 == 0)
+    row = start
+    max_rows = int(it["max_rows"])
+    for idx, item in enumerate(items[:max_rows]):
+        ws.set_row(r0(row), it["row_height"])
+
+        gray = ((idx % 2) == 1) if it["zebra_gray_on_odd_rows"] else ((idx % 2) == 0)
         lf = td_left_g if gray else td_left
         cf = td_c_g if gray else td_c
         mf = money_g if gray else money
 
-        span_write(row, s["concept"][0], s["concept"][1], item.concept, lf)
-        span_write(row, s["unit_cost"][0], s["unit_cost"][1], item.unit_cost or 0, mf)
-        span_write(row, s["units"][0], s["units"][1], item.units or 0, cf)
+        # Concept
+        merge_write_row(row, s["concept"][0], s["concept"][1], item.concept, lf)
 
+        # Unit cost (currency)
+        # IMPORTANT: write number (not string) so Excel formats as money
+        ws.merge_range(range_a1(row, s["unit_cost"][0], row, s["unit_cost"][1]), float(item.unit_cost or 0), mf)
+
+        # Units
+        ws.merge_range(range_a1(row, s["units"][0], row, s["units"][1]), float(item.units or 0), cf)
+
+        # Subtotal
         subtotal = float(item.unit_cost or 0) * float(item.units or 0)
-        span_write(row, s["subtotal"][0], s["subtotal"][1], subtotal, mf)
+        ws.merge_range(range_a1(row, s["subtotal"][0], row, s["subtotal"][1]), subtotal, mf)
 
         row += 1
 

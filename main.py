@@ -1,302 +1,173 @@
-# main.py
-# Excel-only ODC generator (NO merged cells). Grid-uniform layout (columns B:Z width=2.5).
-# FastAPI endpoint: POST /generate-odc-excel
-#
-# Python 3.11 + openpyxl
-#
-# Notes:
-# - We simulate "merged" headers using Alignment(horizontal="centerContinuous") a.k.a. Center Across Selection.
-# - Layout is drawn by painting rectangles (fills/borders) and writing text across ranges.
-
-from __future__ import annotations
-
-from io import BytesIO
-from datetime import date
-from typing import Any, Dict, List, Optional, Tuple
-
 from fastapi import FastAPI
-from fastapi.responses import Response
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
+from typing import List, Optional
+from io import BytesIO
+from datetime import datetime
 
-from openpyxl import Workbook
-from openpyxl.worksheet.worksheet import Worksheet
-from openpyxl.utils import column_index_from_string
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+import xlsxwriter
 
-
-# -----------------------------------------------------------------------------
-# FastAPI
-# -----------------------------------------------------------------------------
-app = FastAPI(title="ODCs - Excel (No Merges)")
+app = FastAPI(title="ODCs Render (Excel Only - No Merges)", version="1.0.0")
 
 
-# -----------------------------------------------------------------------------
-# Models
-# -----------------------------------------------------------------------------
+# ----------------- MODELOS -----------------
 class ODCItem(BaseModel):
     concept: str
     unit_cost: float
     units: float
 
-    @property
-    def subtotal(self) -> float:
-        return float(self.unit_cost) * float(self.units)
-
 
 class ODCRequest(BaseModel):
     odc_number: str = Field(..., examples=["RI-02497"])
-    issue_date: Optional[str] = Field(None, examples=["17 nov 2025"])  # keep as string for exact formatting
+    issue_date: Optional[str] = Field(default_factory=lambda: datetime.now().strftime("%d %b %Y"))
+
     supplier: str
     service: str
     project: str
 
-    bill_to_name: str = Field(..., examples=["ASESORES GLOBALES CORPORATIVOS"])
-    bill_to_rfc: str = Field(..., examples=["AGC051117MX5"])
-    bill_to_address_1: str = Field(..., examples=["Peregrinos 24, Colinas del Sur,"])
-    bill_to_address_2: str = Field(..., examples=["Álvaro Obregón, CP. 01430, CDMX"])
+    bill_to_name: str
+    bill_to_rfc: str
+    bill_to_address_1: str
+    bill_to_address_2: str
 
     items: List[ODCItem] = Field(default_factory=list)
 
 
-# -----------------------------------------------------------------------------
-# Grid + Ranges (based on your screenshot)
-# -----------------------------------------------------------------------------
-GRID_COL_START = "B"
-GRID_COL_END = "Z"
-GRID_ROW_TOP = 2
-
-BASE_COL_WIDTH = 2.5
-BASE_ROW_HEIGHT = 18  # uniform baseline; specific rows override below
-
-# Convenience: convert "B".."Z" to indices
-C0 = column_index_from_string(GRID_COL_START)
-C1 = column_index_from_string(GRID_COL_END)
-
-# Major blocks (row, col, row, col) in grid coordinates
-R_BANNER = (2, C0, 4, C1)          # B2:Z4
-R_ODC_BOX = (3, column_index_from_string("T"), 3, C1)  # T3:Z3
-
-R_LEFT_BLOCK = (5, C0, 9, column_index_from_string("O"))      # B5:O9
-R_RIGHT_BLOCK = (5, column_index_from_string("Q"), 9, C1)     # Q5:Z9
-
-R_ITEMS_HEADER = (11, C0, 11, C1)   # B11:Z11
-# items body: starts at row 12; ends dynamically
-
-# Column splits for items table (approx from screenshot)
-# Concept: B:N | Unit cost: O:S | Units: T:V | Subtotal: W:Z
-COL_CONCEPT = (column_index_from_string("B"), column_index_from_string("N"))
-COL_UNIT_COST = (column_index_from_string("O"), column_index_from_string("S"))
-COL_UNITS = (column_index_from_string("T"), column_index_from_string("V"))
-COL_SUBTOTAL = (column_index_from_string("W"), column_index_from_string("Z"))
-
-# Left info block label/value split
-LEFT_LABEL = (column_index_from_string("B"), column_index_from_string("E"))  # B:E
-LEFT_VALUE = (column_index_from_string("F"), column_index_from_string("O"))  # F:O
-LEFT_DIVIDER_COL = column_index_from_string("E")  # vertical divider at end of labels
+# ----------------- RUTAS -----------------
+@app.get("/health")
+def health():
+    return {"ok": True, "time": datetime.now().isoformat()}
 
 
-# -----------------------------------------------------------------------------
-# Styles
-# -----------------------------------------------------------------------------
-# Colors (tuned to screenshot vibe)
-COLOR_TEAL = "0F3B4A"        # dark teal
-COLOR_TEAL_2 = "0D4A60"      # slightly brighter for table header
-COLOR_LIGHT_GRAY = "EFEFEF"
-COLOR_WHITE = "FFFFFF"
-COLOR_BLACK = "000000"
-COLOR_ACCENT_LABEL = "0D4A60"
-COLOR_RED = "D50000"
-
-FILL_TEAL = PatternFill("solid", fgColor=COLOR_TEAL)
-FILL_TEAL_2 = PatternFill("solid", fgColor=COLOR_TEAL_2)
-FILL_GRAY = PatternFill("solid", fgColor=COLOR_LIGHT_GRAY)
-FILL_WHITE = PatternFill("solid", fgColor=COLOR_WHITE)
-
-SIDE_THIN = Side(style="thin", color="6B6B6B")
-BORDER_THIN = Border(left=SIDE_THIN, right=SIDE_THIN, top=SIDE_THIN, bottom=SIDE_THIN)
-
-SIDE_DIV = Side(style="thin", color="8A8A8A")
-BORDER_RIGHT_DIV = Border(right=SIDE_DIV)
-BORDER_LEFT_DIV = Border(left=SIDE_DIV)
-
-FONT_SAPIENCE = Font(name="Calibri", size=34, bold=True, color="FFFFFF")
-FONT_TAGLINE = Font(name="Calibri", size=12, color="CFE3EA")
-FONT_LABEL = Font(name="Calibri", size=14, bold=True, color=COLOR_ACCENT_LABEL)
-FONT_VALUE = Font(name="Calibri", size=16, color=COLOR_BLACK)
-
-FONT_FACTURAR = Font(name="Calibri", size=22, bold=True, color=COLOR_ACCENT_LABEL)
-FONT_BILL_TO_BOLD = Font(name="Calibri", size=16, bold=True, color=COLOR_BLACK)
-FONT_BILL_TO = Font(name="Calibri", size=16, color=COLOR_BLACK)
-
-FONT_TABLE_HEADER = Font(name="Calibri", size=16, bold=True, color="FFFFFF")
-FONT_TABLE_BODY = Font(name="Calibri", size=16, color=COLOR_BLACK)
-
-ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
-ALIGN_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
-ALIGN_RIGHT = Alignment(horizontal="right", vertical="center", wrap_text=True)
-
-# Center across selection (no merges)
-ALIGN_CENTER_ACROSS = Alignment(horizontal="centerContinuous", vertical="center", wrap_text=True)
-
-
-# -----------------------------------------------------------------------------
-# Helpers (NO merges)
-# -----------------------------------------------------------------------------
-def set_uniform_grid(ws: Worksheet) -> None:
-    # Columns B:Z all same width
-    for col in range(C0, C1 + 1):
-        ws.column_dimensions[_col_letter(col)].width = BASE_COL_WIDTH
-
-    # Basic row heights (we set a reasonable span)
-    for r in range(1, 200):
-        ws.row_dimensions[r].height = BASE_ROW_HEIGHT
-
-    # Custom heights to match screenshot proportions
-    ws.row_dimensions[2].height = 26
-    ws.row_dimensions[3].height = 26
-    ws.row_dimensions[4].height = 22
-    ws.row_dimensions[11].height = 28  # table header slightly taller
-
-
-def _col_letter(col_idx: int) -> str:
-    # openpyxl get_column_letter is fine, but avoid extra import
-    from openpyxl.utils import get_column_letter
-    return get_column_letter(col_idx)
-
-
-def fill_range(ws: Worksheet, r1: int, c1: int, r2: int, c2: int, fill: PatternFill) -> None:
-    for r in range(r1, r2 + 1):
-        for c in range(c1, c2 + 1):
-            ws.cell(row=r, column=c).fill = fill
-
-
-def border_range(ws: Worksheet, r1: int, c1: int, r2: int, c2: int, border: Border) -> None:
-    for r in range(r1, r2 + 1):
-        for c in range(c1, c2 + 1):
-            ws.cell(row=r, column=c).border = border
-
-
-def outline_range(ws: Worksheet, r1: int, c1: int, r2: int, c2: int, border: Border) -> None:
-    # simple outline: apply border to all cells on perimeter
-    for c in range(c1, c2 + 1):
-        ws.cell(row=r1, column=c).border = border
-        ws.cell(row=r2, column=c).border = border
-    for r in range(r1, r2 + 1):
-        ws.cell(row=r, column=c1).border = border
-        ws.cell(row=r, column=c2).border = border
-
-
-def vline_right(ws: Worksheet, col: int, r1: int, r2: int, side: Side = SIDE_DIV) -> None:
-    for r in range(r1, r2 + 1):
-        cell = ws.cell(row=r, column=col)
-        cell.border = Border(
-            left=cell.border.left,
-            right=side,
-            top=cell.border.top,
-            bottom=cell.border.bottom,
+@app.post("/generate-odc-excel")
+def generate_odc_excel(payload: ODCRequest):
+    try:
+        xlsx_bytes = build_odc_excel(payload)
+        filename = f"ODC_{payload.odc_number}_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+        return StreamingResponse(
+            BytesIO(xlsx_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+    except Exception as e:
+        # devuelve el error real (como tu main que funciona)
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-def write_across(
-    ws: Worksheet,
-    row: int,
-    col_start: int,
-    col_end: int,
-    value: Any,
-    *,
-    font: Optional[Font] = None,
-    fill: Optional[PatternFill] = None,
-    align: Alignment = ALIGN_CENTER_ACROSS,
-    number_format: Optional[str] = None,
-) -> None:
-    # Put the value only in the left cell
-    cell0 = ws.cell(row=row, column=col_start)
-    cell0.value = value
+# ----------------- GENERADOR -----------------
+def build_odc_excel(payload: ODCRequest) -> bytes:
+    out = BytesIO()
+    wb = xlsxwriter.Workbook(out, {"in_memory": True})
+    ws = wb.add_worksheet("ODC")
 
-    for c in range(col_start, col_end + 1):
-        cell = ws.cell(row=row, column=c)
-        cell.alignment = align
-        if font:
-            cell.font = font
-        if fill:
-            cell.fill = fill
-        if number_format:
-            cell.number_format = number_format
+    # ----- Paleta (ajústala si quieres calcar exacto) -----
+    TEAL = "#0F3B4A"
+    TEAL_2 = "#0D4A60"
+    WHITE = "#FFFFFF"
+    GRAY = "#EFEFEF"
+    BLACK = "#000000"
+    RED = "#D50000"
 
+    FONT = "Calibri"  # usa Calibri para máxima compatibilidad Excel/PDF
 
-def write_cell(
-    ws: Worksheet,
-    row: int,
-    col: int,
-    value: Any,
-    *,
-    font: Optional[Font] = None,
-    align: Alignment = ALIGN_LEFT,
-    fill: Optional[PatternFill] = None,
-    number_format: Optional[str] = None,
-) -> None:
-    cell = ws.cell(row=row, column=col)
-    cell.value = value
-    cell.alignment = align
-    if font:
-        cell.font = font
-    if fill:
-        cell.fill = fill
-    if number_format:
-        cell.number_format = number_format
+    # ----- Formats -----
+    fmt_white = wb.add_format({"bg_color": WHITE})
+    fmt_banner_bg = wb.add_format({"bg_color": TEAL})
+    fmt_banner_title = wb.add_format({"font_name": FONT, "font_size": 34, "bold": True, "font_color": WHITE, "bg_color": TEAL, "align": "left", "valign": "vcenter"})
+    fmt_banner_sub = wb.add_format({"font_name": FONT, "font_size": 12, "font_color": "#CFE3EA", "bg_color": TEAL, "align": "left", "valign": "vcenter"})
 
+    fmt_box = wb.add_format({"bg_color": GRAY, "border": 1, "align": "center", "valign": "vcenter", "font_name": FONT})
+    fmt_box_label = wb.add_format({"bg_color": GRAY, "border": 1, "align": "center", "valign": "vcenter", "font_name": FONT, "font_size": 16, "bold": True, "font_color": TEAL_2})
+    fmt_box_value = wb.add_format({"bg_color": GRAY, "border": 1, "align": "center", "valign": "vcenter", "font_name": FONT, "font_size": 18, "bold": True, "font_color": RED})
 
-# -----------------------------------------------------------------------------
-# Drawing sections (NO merges)
-# -----------------------------------------------------------------------------
-def draw_banner(ws: Worksheet, data: ODCRequest) -> None:
-    r1, c1, r2, c2 = R_BANNER
-    fill_range(ws, r1, c1, r2, c2, FILL_TEAL)
+    fmt_label = wb.add_format({"font_name": FONT, "font_size": 14, "bold": True, "font_color": TEAL_2, "align": "right", "valign": "vcenter"})
+    fmt_value = wb.add_format({"font_name": FONT, "font_size": 16, "font_color": BLACK, "align": "left", "valign": "vcenter"})
 
-    # "SAPIENCE" and tagline (left)
-    write_cell(ws, 3, column_index_from_string("B"), "SAPIENCE", font=FONT_SAPIENCE, align=ALIGN_LEFT, fill=FILL_TEAL)
-    write_cell(ws, 4, column_index_from_string("B"), "Human Insights Strategy", font=FONT_TAGLINE, align=ALIGN_LEFT, fill=FILL_TEAL)
+    fmt_label_gray = wb.add_format({**fmt_label.properties, "bg_color": GRAY})
+    fmt_value_gray = wb.add_format({**fmt_value.properties, "bg_color": GRAY})
 
-    # ODC box (top-right) - draw rectangle + divider
-    br1, bc1, br2, bc2 = R_ODC_BOX
-    fill_range(ws, br1, bc1, br2, bc2, FILL_GRAY)
-    border_range(ws, br1, bc1, br2, bc2, BORDER_THIN)
+    fmt_facturar = wb.add_format({"font_name": FONT, "font_size": 22, "bold": True, "font_color": TEAL_2, "align": "center", "valign": "vcenter"})
+    fmt_bill_bold = wb.add_format({"font_name": FONT, "font_size": 16, "bold": True, "font_color": BLACK, "align": "left", "valign": "vcenter"})
+    fmt_bill = wb.add_format({"font_name": FONT, "font_size": 16, "font_color": BLACK, "align": "left", "valign": "vcenter"})
 
-    # divider roughly between label and value (use W as divider)
-    divider_col = column_index_from_string("W")
-    vline_right(ws, divider_col, br1, br2, SIDE_THIN)
+    fmt_th = wb.add_format({"font_name": FONT, "font_size": 16, "bold": True, "font_color": WHITE, "bg_color": TEAL_2, "border": 1, "align": "center", "valign": "vcenter"})
+    fmt_td_left = wb.add_format({"font_name": FONT, "font_size": 16, "font_color": BLACK, "border": 1, "align": "left", "valign": "vcenter", "text_wrap": True})
+    fmt_td_center = wb.add_format({"font_name": FONT, "font_size": 16, "font_color": BLACK, "border": 1, "align": "center", "valign": "vcenter"})
+    fmt_td_center_gray = wb.add_format({**fmt_td_center.properties, "bg_color": GRAY})
+    fmt_td_left_gray = wb.add_format({**fmt_td_left.properties, "bg_color": GRAY})
 
-    # label "ODC #:" on left part
-    write_across(
-        ws, br1,
-        bc1, divider_col,
-        "ODC #:",
-        font=Font(name="Calibri", size=16, bold=True, color=COLOR_ACCENT_LABEL),
-        fill=FILL_GRAY,
-        align=ALIGN_CENTER_ACROSS
-    )
+    money_fmt = wb.add_format({"font_name": FONT, "font_size": 16, "font_color": BLACK, "border": 1, "align": "center", "valign": "vcenter", "num_format": '"$"#,##0'})
+    money_fmt_gray = wb.add_format({**money_fmt.properties, "bg_color": GRAY})
 
-    # value in red on right part
-    write_across(
-        ws, br1,
-        divider_col + 1, bc2,
-        data.odc_number,
-        font=Font(name="Calibri", size=18, bold=True, color=COLOR_RED),
-        fill=FILL_GRAY,
-        align=ALIGN_CENTER_ACROSS
-    )
+    # ----- Grid uniform B:Z width=2.5 -----
+    # xlsxwriter uses 0-indexed columns: A=0, B=1 ... Z=25
+    # Set a big white background format so unpainted areas are clean:
+    for c in range(0, 60):
+        ws.set_column(c, c, None, fmt_white)
 
+    # Columns B..Z all 2.5
+    for c in range(1, 26):  # B(1) .. Z(25)
+        ws.set_column(c, c, 2.5, fmt_white)
 
-def draw_left_info(ws: Worksheet, data: ODCRequest) -> None:
-    r1, c1, r2, c2 = R_LEFT_BLOCK
+    # Uniform row heights baseline + special rows
+    for r in range(0, 200):
+        ws.set_row(r, 18)
+    # Banner (rows 2-4 in Excel = index 1-3 if you start at 1? careful)
+    # We'll work in Excel-like numbers below and convert to 0-index.
+    def r0(excel_row: int) -> int:
+        return excel_row - 1
 
-    # Zebra rows like screenshot: 5,7,9 grey; 6,8 white
-    for row in range(r1, r2 + 1):
-        fill = FILL_GRAY if row in (5, 7, 9) else FILL_WHITE
-        fill_range(ws, row, c1, row, c2, fill)
+    # helper to get col index from Excel letter
+    def c0(letter: str) -> int:
+        return ord(letter.upper()) - ord("A")
 
-    # Divider line between label and value (end of E)
-    vline_right(ws, LEFT_DIVIDER_COL, r1, r2, SIDE_DIV)
+    # Helpers: rect + across writing (no merges)
+    def rect(r1, c1, r2, c2, fmt):
+        # r/c passed as 1-based Excel coordinates; uses write_blank to paint
+        for rr in range(r0(r1), r0(r2) + 1):
+            for cc in range(c0(c1), c0(c2) + 1):
+                ws.write_blank(rr, cc, None, fmt)
+
+    def across(row, c_start, c_end, text, fmt):
+        # write text in leftmost cell, paint the rest as blanks
+        rr = r0(row)
+        cs = c0(c_start)
+        ce = c0(c_end)
+        ws.write(rr, cs, text, fmt)
+        for cc in range(cs + 1, ce + 1):
+            ws.write_blank(rr, cc, None, fmt)
+
+    # ----- Layout (based on your screenshot) -----
+    # Banner B2:Z4
+    ws.set_row(r0(2), 26)
+    ws.set_row(r0(3), 26)
+    ws.set_row(r0(4), 22)
+    rect(2, "B", 4, "Z", fmt_banner_bg)
+    ws.write(r0(3), c0("B"), "SAPIENCE", fmt_banner_title)
+    ws.write(r0(4), c0("B"), "Human Insights Strategy", fmt_banner_sub)
+
+    # ODC box T3:Z3 with divider at W
+    rect(3, "T", 3, "Z", fmt_box)
+    across(3, "T", "W", "ODC #:", fmt_box_label)
+    across(3, "X", "Z", payload.odc_number, fmt_box_value)
+
+    # Left table B5:O9 with zebra rows 5,7,9 gray
+    # Labels B:E, Values F:O, divider after E
+    def zebra_fmt(row_num):
+        return GRAY if row_num in (5, 7, 9) else WHITE
+
+    for row in range(5, 10):
+        bg = zebra_fmt(row)
+        if bg == GRAY:
+            rect(row, "B", row, "O", wb.add_format({"bg_color": GRAY}))
+        else:
+            rect(row, "B", row, "O", wb.add_format({"bg_color": WHITE}))
+
+    # Divider line: simulate by applying border to column E cells (right border)
+    divider_fmt_gray = wb.add_format({"bg_color": GRAY, "right": 1})
+    divider_fmt_white = wb.add_format({"bg_color": WHITE, "right": 1})
+    for row in range(5, 10):
+        ws.write_blank(r0(row), c0("E"), None, divider_fmt_gray if zebra_fmt(row) == GRAY else divider_fmt_white)
 
     # Labels
     labels = [
@@ -306,190 +177,70 @@ def draw_left_info(ws: Worksheet, data: ODCRequest) -> None:
         ("SERVICIO:", 8),
         ("PROYECTO:", 9),
     ]
-    for text, row in labels:
-        # right-aligned label across B:E
-        write_across(
-            ws, row,
-            LEFT_LABEL[0], LEFT_LABEL[1],
-            text,
-            font=FONT_LABEL,
-            fill=ws.cell(row=row, column=LEFT_LABEL[0]).fill,  # keep zebra
-            align=Alignment(horizontal="right", vertical="center", wrap_text=True),
-        )
+    for txt, row in labels:
+        bg = zebra_fmt(row)
+        across(row, "B", "E", txt, fmt_label_gray if bg == GRAY else fmt_label)
 
     # Values
-    issue = data.issue_date or ""  # keep string formatting given by client
     values = [
-        (data.odc_number, 5),
-        (issue, 6),
-        (data.supplier, 7),
-        (data.service, 8),
-        (data.project, 9),
+        (payload.odc_number, 5),
+        (payload.issue_date or "", 6),
+        (payload.supplier, 7),
+        (payload.service, 8),
+        (payload.project, 9),
     ]
-    for val, row in values:
-        # left-aligned across F:O
-        write_across(
-            ws, row,
-            LEFT_VALUE[0], LEFT_VALUE[1],
-            val,
-            font=FONT_VALUE,
-            fill=ws.cell(row=row, column=LEFT_VALUE[0]).fill,
-            align=Alignment(horizontal="left", vertical="center", wrap_text=True),
-        )
+    for txt, row in values:
+        bg = zebra_fmt(row)
+        across(row, "F", "O", txt, fmt_value_gray if bg == GRAY else fmt_value)
 
+    # Right block Q5:Z9 (Facturar a)
+    # Title centered across Q:Z row 5
+    across(5, "Q", "Z", "FACTURAR A:", fmt_facturar)
+    ws.write(r0(6), c0("Q"), payload.bill_to_name, fmt_bill_bold)
+    ws.write(r0(7), c0("Q"), f"RFC: {payload.bill_to_rfc}", fmt_bill_bold)
+    ws.write(r0(8), c0("Q"), payload.bill_to_address_1, fmt_bill)
+    ws.write(r0(9), c0("Q"), payload.bill_to_address_2, fmt_bill)
 
-def draw_bill_to(ws: Worksheet, data: ODCRequest) -> None:
-    # Minimal styling; text positions match screenshot vibe
-    r1, c1, r2, c2 = R_RIGHT_BLOCK
-    # keep background white
-    fill_range(ws, r1, c1, r2, c2, FILL_WHITE)
+    # Items header row 11: B..Z teal
+    ws.set_row(r0(11), 28)
+    rect(11, "B", 11, "Z", fmt_th)
 
-    # "FACTURAR A:" large teal
-    write_across(
-        ws, 5,
-        c1, c2,
-        "FACTURAR A:",
-        font=FONT_FACTURAR,
-        fill=FILL_WHITE,
-        align=Alignment(horizontal="centerContinuous", vertical="center", wrap_text=True),
-    )
+    # Splits: Concept B:N | Unit cost O:S | Units T:V | Subtotal W:Z
+    across(11, "B", "N", "Concepto", fmt_th)
+    across(11, "O", "S", "Costo unitario", fmt_th)
+    across(11, "T", "V", "Unidades", fmt_th)
+    across(11, "W", "Z", "Subtotal", fmt_th)
 
-    # Lines below (left aligned inside the block)
-    # place starting at Q6 (c1)
-    write_cell(ws, 6, c1, data.bill_to_name, font=FONT_BILL_TO_BOLD, align=ALIGN_LEFT)
-    write_cell(ws, 7, c1, f"RFC: {data.bill_to_rfc}", font=FONT_BILL_TO_BOLD, align=ALIGN_LEFT)
-    write_cell(ws, 8, c1, data.bill_to_address_1, font=FONT_BILL_TO, align=ALIGN_LEFT)
-    write_cell(ws, 9, c1, data.bill_to_address_2, font=FONT_BILL_TO, align=ALIGN_LEFT)
+    # Items body starting row 12
+    start = 12
+    items = payload.items or [ODCItem(concept="", unit_cost=0.0, units=0.0)]
+    row = start
+    for i, it in enumerate(items):
+        zebra = (row % 2 == 1)  # 13,15,... gray (like your mock)
+        left_fmt = fmt_td_left_gray if zebra else fmt_td_left
+        cen_fmt = fmt_td_center_gray if zebra else fmt_td_center
+        mon_fmt = money_fmt_gray if zebra else money_fmt
 
-
-def draw_items_table(ws: Worksheet, items: List[ODCItem]) -> int:
-    # Header
-    hr, c1, _, c2 = R_ITEMS_HEADER
-    fill_range(ws, hr, c1, hr, c2, FILL_TEAL_2)
-    border_range(ws, hr, c1, hr, c2, BORDER_THIN)
-
-    # Vertical dividers for header + body
-    # We'll add borders in a full range after body is known; for now header titles:
-    write_across(ws, hr, COL_CONCEPT[0], COL_CONCEPT[1], "Concepto", font=FONT_TABLE_HEADER, fill=FILL_TEAL_2)
-    write_across(ws, hr, COL_UNIT_COST[0], COL_UNIT_COST[1], "Costo unitario", font=FONT_TABLE_HEADER, fill=FILL_TEAL_2)
-    write_across(ws, hr, COL_UNITS[0], COL_UNITS[1], "Unidades", font=FONT_TABLE_HEADER, fill=FILL_TEAL_2)
-    write_across(ws, hr, COL_SUBTOTAL[0], COL_SUBTOTAL[1], "Subtotal", font=FONT_TABLE_HEADER, fill=FILL_TEAL_2)
-
-    # Body starts at row 12
-    start_row = hr + 1
-    row = start_row
-
-    # If no items, still draw 1 empty row like a template
-    if not items:
-        items = [ODCItem(concept="", unit_cost=0.0, units=0.0)]
-
-    for idx, it in enumerate(items):
-        # zebra: row 13,15,... light gray (as screenshot)
-        fill = FILL_GRAY if (row % 2 == 1) else FILL_WHITE
-        fill_range(ws, row, c1, row, c2, fill)
-
-        # Concept (left)
-        write_across(
-            ws, row, COL_CONCEPT[0], COL_CONCEPT[1],
-            it.concept,
-            font=FONT_TABLE_BODY,
-            fill=fill,
-            align=Alignment(horizontal="left", vertical="center", wrap_text=True),
-        )
-        # Unit cost (center)
-        write_across(
-            ws, row, COL_UNIT_COST[0], COL_UNIT_COST[1],
-            it.unit_cost if it.unit_cost else "",
-            font=FONT_TABLE_BODY,
-            fill=fill,
-            align=ALIGN_CENTER_ACROSS,
-            number_format='"$"#,##0',
-        )
-        # Units (center)
-        write_across(
-            ws, row, COL_UNITS[0], COL_UNITS[1],
-            it.units if it.units else "",
-            font=FONT_TABLE_BODY,
-            fill=fill,
-            align=ALIGN_CENTER_ACROSS,
-            number_format='0',
-        )
-        # Subtotal (center)
-        write_across(
-            ws, row, COL_SUBTOTAL[0], COL_SUBTOTAL[1],
-            it.subtotal if it.subtotal else "",
-            font=FONT_TABLE_BODY,
-            fill=fill,
-            align=ALIGN_CENTER_ACROSS,
-            number_format='"$"#,##0',
-        )
+        # paint row blocks (borders handled by formats)
+        across(row, "B", "N", it.concept, left_fmt)
+        across(row, "O", "S", (it.unit_cost if it.unit_cost else ""), mon_fmt)
+        across(row, "T", "V", (it.units if it.units else ""), cen_fmt)
+        subtotal = (it.unit_cost or 0.0) * (it.units or 0.0)
+        across(row, "W", "Z", (subtotal if subtotal else ""), mon_fmt)
 
         row += 1
 
-    end_row = row - 1
+    last_row = row - 1
 
-    # Apply borders to the whole table (header + body)
-    border_range(ws, hr, c1, end_row, c2, BORDER_THIN)
+    # Print setup (Excel will use this when exporting to PDF)
+    ws.set_paper(1)            # 1 = Letter
+    ws.set_landscape(False)    # portrait
+    ws.set_margins(0.3, 0.3, 0.35, 0.35)
+    ws.fit_to_pages(1, 1)
 
-    return end_row
+    # Print area B2:Z<last_row>
+    ws.print_area(r0(2), c0("B"), r0(last_row), c0("Z"))
 
+    wb.close()
+    return out.getvalue()
 
-def set_print_settings(ws: Worksheet, last_row: int) -> None:
-    # Paper & scaling: tuned for stable PDF export from Excel
-    ws.page_setup.orientation = ws.ORIENTATION_PORTRAIT
-    ws.page_setup.paperSize = ws.PAPERSIZE_LETTER
-    ws.page_margins.left = 0.3
-    ws.page_margins.right = 0.3
-    ws.page_margins.top = 0.35
-    ws.page_margins.bottom = 0.35
-
-    ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 1
-
-    # Print area: from B2 to Z<last_row> (table end)
-    ws.print_area = f"{GRID_COL_START}{GRID_ROW_TOP}:{GRID_COL_END}{last_row}"
-
-
-# -----------------------------------------------------------------------------
-# Workbook builder
-# -----------------------------------------------------------------------------
-def build_odc_workbook(data: ODCRequest) -> Workbook:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "ODC"
-
-    set_uniform_grid(ws)
-
-    # Base background (white across an ample region)
-    fill_range(ws, 1, 1, 200, 60, FILL_WHITE)
-
-    draw_banner(ws, data)
-    draw_left_info(ws, data)
-    draw_bill_to(ws, data)
-    last_row = draw_items_table(ws, data.items)
-
-    set_print_settings(ws, last_row)
-
-    return wb
-
-
-def workbook_to_bytes(wb: Workbook) -> bytes:
-    bio = BytesIO()
-    wb.save(bio)
-    return bio.getvalue()
-
-
-# -----------------------------------------------------------------------------
-# Endpoint
-# -----------------------------------------------------------------------------
-@app.post("/generate-odc-excel")
-def generate_odc_excel(payload: ODCRequest):
-    wb = build_odc_workbook(payload)
-    xlsx_bytes = workbook_to_bytes(wb)
-
-    filename = f"ODC_{payload.odc_number}.xlsx"
-    return Response(
-        content=xlsx_bytes,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )

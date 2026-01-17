@@ -484,7 +484,7 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
     ws.merge_range(tot_row - 1, 22, tot_row - 1, 25, total_due, total_value_fmt)
 
     # -------- Print settings --------
-    ws.set_landscape()
+    ws.set_portrait()
     ws.set_paper(9)  # A4
     ws.set_margins(left=0.25, right=0.25, top=0.35, bottom=0.35)
     ws.fit_to_pages(1, 0)

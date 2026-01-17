@@ -294,35 +294,35 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
 
     # Summary formats
     sum_label_fmt = wb.add_format({
-        "font_name": FONT, "font_size": 10, "bold": True,
+        "font_name": FONT, "font_size": 9, "bold": True,
         "align": "right", "valign": "vcenter",
         "font_color": TEAL_2, "bg_color": WHITE
     })
     adv_label_fmt = wb.add_format({
-        "font_name": FONT, "font_size": 10, "bold": True,
+        "font_name": FONT, "font_size": 9, "bold": True,
         "align": "right", "valign": "vcenter",
         "font_color": TEAL_2, "bg_color": WHITE
     })
     total_label_fmt = wb.add_format({
-        "font_name": FONT, "font_size": 10, "bold": True,
+        "font_name": FONT, "font_size": 9, "bold": True,
         "align": "right", "valign": "vcenter",
         "font_color": TEAL_2, "bg_color": WHITE
     })
 
     sum_value_fmt = wb.add_format({
-        "font_name": FONT, "font_size": 10,
+        "font_name": FONT, "font_size": 9,
         "align": "center", "valign": "vcenter",
         "font_color": GRAY_TEXT, "bg_color": WHITE,
         "num_format": f'"{payload.currency_symbol}"#,##0.00'
     })
     adv_value_fmt = wb.add_format({
-        "font_name": FONT, "font_size": 10, "bold": True,
+        "font_name": FONT, "font_size": 9, "bold": True,
         "align": "center", "valign": "vcenter",
         "font_color": RED, "bg_color": WHITE,
         "num_format": f'"{payload.currency_symbol}"#,##0.00'
     })
     total_value_fmt = wb.add_format({
-        "font_name": FONT, "font_size": 13, "bold": True,
+        "font_name": FONT, "font_size": 10, "bold": True,
         "align": "center", "valign": "vcenter",
         "font_color": BLACK, "bg_color": WHITE,
         "num_format": f'"{payload.currency_symbol}"#,##0.00'

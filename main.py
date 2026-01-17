@@ -166,7 +166,7 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
 
     # -------- Explicit white canvas (no transparency) --------
     white_bg = wb.add_format({"bg_color": WHITE})
-    fill_range(ws, 1, 1, 200, 26, white_bg)
+    fill_range(ws, 1, 1, 200, 50, white_bg)
 
     # Base fills
     banner_fill = wb.add_format({"bg_color": TEAL})

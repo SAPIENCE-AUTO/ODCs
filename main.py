@@ -1,21 +1,13 @@
 # main.py
 # Sapience ODCs — Render + FastAPI — Excel only (XlsxWriter)
-# v1.1.0
-#
-# Key rules (requested):
-# - Banner azul: 3 filas de 16 pts (48 total)
-# - Logo más chico y bien ubicado (no se sale del banner)
-# - ODC box arriba derecha: menos alto (1 fila)
-# - Meta izquierda: blanco/gris alternado empezando en blanco
-# - Línea divisoria gris vertical junto a labels (ODC/FECHA/PROVEEDOR/etc.)
-# - FACTURAR A y datos con fondo blanco explícito
-# - Headers tabla: 9 pt
-# - Celdas tabla: 8 pt y centrado vertical
-# - Abajo: SUMA / ANTICIPO / TOTAL con números centrados horizontalmente
-#
-# Notes:
-# - Pydantic acepta: sum_amount, advance_amount, total_due
-# - Compatibilidad: si solo viene total, se usa como total_due (y suma/anticipo quedan en 0)
+# v1.0.6
+# - Banner height fixed: 3 rows x 16 pts
+# - Logo smaller and safely inside banner
+# - Left meta alternating white/gray/white (with vertical divider line)
+# - Bill-to block painted WHITE (no transparent)
+# - Table header font 9, table body 8
+# - Table body vertically centered
+# - Summary block: SUMA / ANTICIPO / TOTAL with wide value merges (no ####) and centered numbers
 
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -31,7 +23,7 @@ import struct
 import xlsxwriter
 from xlsxwriter.utility import xl_range
 
-app = FastAPI(title="Sapience ODCs (Excel)", version="1.1.0")
+app = FastAPI(title="Sapience ODCs (Excel)", version="1.0.6")
 
 
 # -----------------------------
@@ -62,13 +54,14 @@ class ODCPayload(BaseModel):
     # Items
     items: List[ODCItem] = Field(default_factory=list)
 
-    # Bottom summary
-    sum_amount: float = 0
-    advance_amount: float = 0
-    total_due: float = 0
-
-    # Backward compatibility (older payloads)
-    total: Optional[float] = None  # if provided and total_due==0, we'll use it
+    # New: Summary amounts (bottom right)
+    # If you don't send them, we compute:
+    # - sum_amount = sum(item subtotals)
+    # - advance_amount = 0
+    # - total_due = sum_amount - advance_amount
+    sum_amount: Optional[float] = None
+    advance_amount: Optional[float] = None
+    total_due: Optional[float] = None
 
     currency_symbol: str = "$"
 
@@ -113,11 +106,11 @@ def fill_range(ws, row1: int, col1: int, row2: int, col2: int, fmt):
 def row_height_for_wrapped_text(
     text: str,
     wrap_width_chars: int,
-    base_line_height: float = 11.5,
-    extra_lines: float = 0.9,
+    base_line_height: float = 11.0,
+    extra_lines: float = 0.6,
 ) -> float:
     """
-    Simulate padding via row height.
+    Estimate wrapped lines and return a row height.
     """
     if not text:
         return base_line_height * (1 + extra_lines)
@@ -166,22 +159,6 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
     wb = xlsxwriter.Workbook(out, {"in_memory": True})
     ws = wb.add_worksheet("ODC")
 
-    # -------- Data normalization --------
-    # If old payloads only send `total`, map it to total_due (unless already set)
-    if safe_float(payload.total_due) == 0 and payload.total is not None:
-        payload.total_due = safe_float(payload.total)
-
-    # If sum_amount not provided but we can infer from items:
-    if safe_float(payload.sum_amount) == 0 and payload.items:
-        payload.sum_amount = sum(
-            safe_float(it.subtotal) if it.subtotal is not None else safe_float(it.unit_cost) * safe_float(it.units)
-            for it in payload.items
-        )
-
-    # If total_due not provided but sum and advance are, infer:
-    if safe_float(payload.total_due) == 0 and safe_float(payload.sum_amount) != 0:
-        payload.total_due = safe_float(payload.sum_amount) - safe_float(payload.advance_amount)
-
     # -------- Palette / Font --------
     FONT = "Montserrat"
     TEAL = "#0F3D4C"
@@ -189,77 +166,84 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
     WHITE = "#FFFFFF"
     LIGHT_GRAY = "#EFEFEF"
     GRID = "#7C7C7C"
+    GRID_LIGHT = "#C9C9C9"
     RED = "#E10600"
     BLACK = "#111111"
-    MID_GRAY = "#C9C9C9"
+    GRAY_TEXT = "#666666"
 
     # -------- Grid columns (uniform 2.5) --------
-    for c in range(0, 26):  # A..Z
+    # Columns A..Z (26)
+    for c in range(0, 26):
         ws.set_column(c, c, 2.5)
 
-    # -------- Explicit white canvas --------
+    # -------- Explicit white canvas (no transparency) --------
     white_bg = wb.add_format({"bg_color": WHITE})
     fill_range(ws, 1, 1, 200, 26, white_bg)
 
+    # Base fills
     banner_fill = wb.add_format({"bg_color": TEAL})
     gray_fill = wb.add_format({"bg_color": LIGHT_GRAY})
 
-    # -------- Formats --------
-    # Top-right ODC box (smaller height: 1 row) — label 9 pt + value 9 pt
+    # Vertical divider (gray line between label/value in left meta)
+    vline_fmt = wb.add_format({"bg_color": WHITE, "left": 1, "left_color": GRID_LIGHT})
+    vline_gray_fmt = wb.add_format({"bg_color": LIGHT_GRAY, "left": 1, "left_color": GRID_LIGHT})
+
+    # Thin underline for summary rows (horizontal separators)
+    hline_fmt = wb.add_format({"bg_color": WHITE, "bottom": 1, "bottom_color": GRID_LIGHT})
+
+    # ODC box top-right
     odc_box_lbl = wb.add_format({
         "font_name": FONT, "font_size": 9, "bold": True,
         "align": "center", "valign": "vcenter",
         "font_color": TEAL_2, "bg_color": WHITE,
-        "border": 1, "border_color": GRID,
+        "border": 1, "border_color": GRID_LIGHT,
     })
     odc_box_val = wb.add_format({
         "font_name": FONT, "font_size": 9, "bold": True,
         "align": "center", "valign": "vcenter",
         "font_color": RED, "bg_color": WHITE,
-        "border": 1, "border_color": GRID,
+        "border": 1, "border_color": GRID_LIGHT,
     })
 
-    # Left meta labels/values (8 pt labels / 8 pt values)
-    label_white = wb.add_format({
-        "font_name": FONT, "font_size": 8, "bold": True,
-        "align": "right", "valign": "vcenter",
-        "font_color": TEAL_2, "bg_color": WHITE,
-        "right": 1, "right_color": MID_GRAY,  # vertical divider line
-    })
-    value_white = wb.add_format({
-        "font_name": FONT, "font_size": 8,
-        "align": "left", "valign": "vcenter",
-        "font_color": BLACK, "bg_color": WHITE,
-        "text_wrap": True,
-    })
+    # Left meta labels/values (alternating stripes)
     label_gray = wb.add_format({
         "font_name": FONT, "font_size": 8, "bold": True,
         "align": "right", "valign": "vcenter",
-        "font_color": TEAL_2, "bg_color": LIGHT_GRAY,
-        "right": 1, "right_color": MID_GRAY,  # vertical divider line
+        "font_color": TEAL_2, "bg_color": LIGHT_GRAY
     })
     value_gray = wb.add_format({
         "font_name": FONT, "font_size": 8,
         "align": "left", "valign": "vcenter",
         "font_color": BLACK, "bg_color": LIGHT_GRAY,
-        "text_wrap": True,
+        "text_wrap": True
+    })
+    label_white = wb.add_format({
+        "font_name": FONT, "font_size": 8, "bold": True,
+        "align": "right", "valign": "vcenter",
+        "font_color": TEAL_2, "bg_color": WHITE
+    })
+    value_white = wb.add_format({
+        "font_name": FONT, "font_size": 8,
+        "align": "left", "valign": "vcenter",
+        "font_color": BLACK, "bg_color": WHITE,
+        "text_wrap": True
     })
 
-    # Bill-to block (white bg explicit)
+    # Bill-to block (painted white)
     bill_title_fmt = wb.add_format({
         "font_name": FONT, "font_size": 10, "bold": True,
         "align": "left", "valign": "vcenter",
-        "font_color": TEAL_2, "bg_color": WHITE,
+        "font_color": TEAL_2, "bg_color": WHITE
     })
     bill_bold_fmt = wb.add_format({
         "font_name": FONT, "font_size": 8, "bold": True,
         "align": "left", "valign": "vcenter",
-        "font_color": BLACK, "bg_color": WHITE,
+        "font_color": BLACK, "bg_color": WHITE
     })
     bill_norm_fmt = wb.add_format({
         "font_name": FONT, "font_size": 8,
         "align": "left", "valign": "vcenter",
-        "font_color": BLACK, "bg_color": WHITE,
+        "font_color": BLACK, "bg_color": WHITE
     })
 
     # Table header (9 pt)
@@ -270,7 +254,7 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
         "border": 1, "border_color": GRID,
     })
 
-    # Table cells (8 pt, vertical centered)
+    # Table cells (8 pt + vertical center)
     concept_w = wb.add_format({
         "font_name": FONT, "font_size": 8,
         "align": "left", "valign": "vcenter",
@@ -311,7 +295,6 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
         "font_color": BLACK,
         "bg_color": WHITE,
         "border": 1, "border_color": GRID,
-        "num_format": "0"
     })
     units_g = wb.add_format({
         "font_name": FONT, "font_size": 8,
@@ -319,60 +302,63 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
         "font_color": BLACK,
         "bg_color": LIGHT_GRAY,
         "border": 1, "border_color": GRID,
-        "num_format": "0"
     })
 
-    # Bottom summary formats (labels teal, values centered horizontally)
+    # Summary formats
     sum_label_fmt = wb.add_format({
         "font_name": FONT, "font_size": 10, "bold": True,
         "align": "right", "valign": "vcenter",
-        "font_color": TEAL_2, "bg_color": WHITE,
+        "font_color": TEAL_2, "bg_color": WHITE
     })
-    sum_value_fmt = wb.add_format({
-        "font_name": FONT, "font_size": 10,
-        "align": "center", "valign": "vcenter",  # centered horizontally
-        "font_color": "#6F6F6F", "bg_color": WHITE,
-        "num_format": f'"{payload.currency_symbol}"#,##0.00',
-    })
-
     adv_label_fmt = wb.add_format({
         "font_name": FONT, "font_size": 10, "bold": True,
         "align": "right", "valign": "vcenter",
-        "font_color": TEAL_2, "bg_color": WHITE,
+        "font_color": TEAL_2, "bg_color": WHITE
     })
-    adv_value_fmt = wb.add_format({
-        "font_name": FONT, "font_size": 10, "bold": True,
-        "align": "center", "valign": "vcenter",  # centered horizontally
-        "font_color": RED, "bg_color": WHITE,
-        "num_format": f'"{payload.currency_symbol}"#,##0.00',
-    })
-
     total_label_fmt = wb.add_format({
         "font_name": FONT, "font_size": 10, "bold": True,
         "align": "right", "valign": "vcenter",
-        "font_color": TEAL_2, "bg_color": WHITE,
+        "font_color": TEAL_2, "bg_color": WHITE
+    })
+
+    sum_value_fmt = wb.add_format({
+        "font_name": FONT, "font_size": 10,
+        "align": "center", "valign": "vcenter",
+        "font_color": GRAY_TEXT, "bg_color": WHITE,
+        "num_format": f'"{payload.currency_symbol}"#,##0.00'
+    })
+    adv_value_fmt = wb.add_format({
+        "font_name": FONT, "font_size": 10, "bold": True,
+        "align": "center", "valign": "vcenter",
+        "font_color": RED, "bg_color": WHITE,
+        "num_format": f'"{payload.currency_symbol}"#,##0.00'
     })
     total_value_fmt = wb.add_format({
-        "font_name": FONT, "font_size": 11, "bold": True,  # prominent
-        "align": "center", "valign": "vcenter",  # centered horizontally
-        "font_color": "#3A3A3A", "bg_color": WHITE,
-        "num_format": f'"{payload.currency_symbol}"#,##0.00',
+        "font_name": FONT, "font_size": 13, "bold": True,
+        "align": "center", "valign": "vcenter",
+        "font_color": BLACK, "bg_color": WHITE,
+        "num_format": f'"{payload.currency_symbol}"#,##0.00'
     })
 
-    # Thin gray line format (for separators under summary rows)
-    hline_fmt = wb.add_format({"bottom": 1, "bottom_color": MID_GRAY, "bg_color": WHITE})
+    # -------- Layout constants --------
+    # A..Z => 0..25
+    LEFT = 1     # B (0-based col index 1)
+    RIGHT = 25   # Z
 
-    # -------- Layout --------
-    # Banner rows: Excel rows 1..3 (each 16 pts)
-    ws.set_row(0, 16)
-    ws.set_row(1, 16)
-    ws.set_row(2, 16)
+    # -------- Banner: 3 rows x 16 pts (rows 1..3 in Excel) --------
+    ws.set_row(0, 16)  # Excel row 1
+    ws.set_row(1, 16)  # Excel row 2
+    ws.set_row(2, 16)  # Excel row 3
 
-    # Paint banner area across B..Z in rows 1..3
-    fill_range(ws, 1, 2, 3, 26, banner_fill)  # B1:Z3
+    # Fill banner B1:Z3
+    fill_range(ws, 1, 2, 3, 26, banner_fill)
 
-    # Insert logo (smaller, anchored within banner, no overflow)
-    # Put it around B1 with conservative scaling and offsets.
+    # ODC box top-right within banner (rows 1..2 of banner)
+    # T..W and X..Z, but less vertical height: merge only rows 1..2
+    ws.merge_range(0, 19, 1, 22, "ODC #:", odc_box_lbl)                 # T..W
+    ws.merge_range(0, 23, 1, 25, payload.odc_number, odc_box_val)       # X..Z
+
+    # Insert logo (smaller, safely inside banner)
     if payload.logo_url:
         try:
             resp = requests.get(payload.logo_url, timeout=15)
@@ -380,29 +366,25 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
             img = resp.content
             wh = _png_size(img)
 
-            # default conservative
-            x_scale = y_scale = 0.18
-            x_off = 6
+            # Conservative caps
+            x_scale = y_scale = 0.12
+            x_off = 8
             y_off = 2
 
             if wh:
                 w_px, h_px = wh
-                # Banner height ~ 48 pts -> approx 64 px (varies), we cap by 52 px to be safe
-                target_h_px = 52
-                target_w_px = 260  # keep modest width
+                target_h_px = 36  # keep within 48px-ish banner height
+                target_w_px = 200
                 scale = min(target_w_px / max(1, w_px), target_h_px / max(1, h_px))
-                # hard caps to avoid overflow
-                scale = max(0.10, min(scale, 0.20))
+                scale = max(0.09, min(scale, 0.13))
                 x_scale = y_scale = scale
 
-                # vertical centering inside 3 rows
                 scaled_h = h_px * y_scale
-                y_off = max(0, int((target_h_px - scaled_h) / 2))
+                y_off = max(1, int((target_h_px - scaled_h) / 2) + 1)
 
+            # Place in C1 (row 1 col C) to avoid bleeding on left edge
             ws.insert_image(
-                0,      # row 1 (0-based)
-                1,      # col B (0-based)
-                "logo.png",
+                0, 2, "logo.png",
                 {
                     "image_data": BytesIO(img),
                     "x_scale": x_scale,
@@ -415,14 +397,7 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
         except Exception:
             pass
 
-    # ODC box (top-right) — 1 row height (row 1), cols U..Z (just tighter visually)
-    # We'll use row 1 (Excel) => row index 0
-    # Label at U..W, Value at X..Z
-    ws.merge_range(0, 20, 0, 22, "ODC #:", odc_box_lbl)                 # U..W
-    ws.merge_range(0, 23, 0, 25, payload.odc_number, odc_box_val)       # X..Z
-
-    # Meta + Bill-to block starts at Excel row 4
-    meta_start_row = 4  # Excel row 4
+    # -------- Left meta block rows 4..8 (Excel) --------
     meta_rows = [
         ("ODC #", payload.odc_number),
         ("FECHA:", payload.date_str),
@@ -431,82 +406,92 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
         ("PROYECTO:", payload.project),
     ]
 
-    # Left block cols B..N (B=2..N=14 => 1..13 0-based)
-    # Alternating starts WHITE then GRAY...
+    # Each row height
     for i, (lab, val) in enumerate(meta_rows):
-        rr = meta_start_row + i  # Excel row number
-        ws.set_row(rr - 1, 18)
+        rr = 4 + i  # 1-based Excel row
+        ws.set_row(rr - 1, 20)
 
-        is_gray = (i % 2 == 1)  # start with white, then gray
+        is_gray = (i % 2 == 0)  # alternating: white/gray/white/gray/white? -> start WHITE below
+        # Requirement says: blanco/gris/blanco alternado
+        # So start with WHITE at rr=4, GRAY at rr=5, etc:
+        is_gray = (i % 2 == 1)
+
         fill_range(ws, rr, 2, rr, 14, gray_fill if is_gray else white_bg)
 
-        ws.merge_range(rr - 1, 1, rr - 1, 4, lab, label_gray if is_gray else label_white)  # B..E
-        ws.merge_range(rr - 1, 5, rr - 1, 13, val, value_gray if is_gray else value_white) # F..N
+        # label B..E (2..5), divider at F, value F..N (6..14)
+        ws.merge_range(rr - 1, 1, rr - 1, 4, lab, label_gray if is_gray else label_white)
 
-    # Bill-to block right side rows 4..8 and cols O..Z (O=15..Z=26)
-    # Ensure white fill explicit
-    fill_range(ws, meta_start_row, 15, meta_start_row + 4, 26, white_bg)
+        # draw vertical divider on column F (col index 5 => 1-based col 6)
+        ws.write_blank(rr - 1, 5, "", vline_gray_fmt if is_gray else vline_fmt)
 
-    ws.merge_range(meta_start_row - 1, 14, meta_start_row - 1, 25, payload.bill_to_title, bill_title_fmt)   # O..Z
-    ws.merge_range(meta_start_row,     14, meta_start_row,     25, payload.bill_to_name,  bill_bold_fmt)
-    ws.merge_range(meta_start_row + 1, 14, meta_start_row + 1, 25, f"RFC: {payload.bill_to_rfc}", bill_bold_fmt)
-    ws.merge_range(meta_start_row + 2, 14, meta_start_row + 2, 25, payload.bill_to_address_1, bill_norm_fmt)
-    ws.merge_range(meta_start_row + 3, 14, meta_start_row + 3, 25, payload.bill_to_address_2, bill_norm_fmt)
+        ws.merge_range(rr - 1, 5, rr - 1, 13, val, value_gray if is_gray else value_white)
 
-    # Spacer row (after meta blocks)
-    spacer_row = meta_start_row + 5  # Excel row 9
-    ws.set_row(spacer_row - 1, 12)
+    # -------- Bill-to block right side rows 4..8 and cols O..Z --------
+    # Paint white explicitly
+    fill_range(ws, 4, 15, 8, 26, white_bg)
+    ws.merge_range(3, 14, 3, 25, payload.bill_to_title, bill_title_fmt)  # row 4
+    ws.merge_range(4, 14, 4, 25, payload.bill_to_name, bill_bold_fmt)    # row 5
+    ws.merge_range(5, 14, 5, 25, f"RFC: {payload.bill_to_rfc}", bill_bold_fmt)
+    ws.merge_range(6, 14, 6, 25, payload.bill_to_address_1, bill_norm_fmt)
+    ws.merge_range(7, 14, 7, 25, payload.bill_to_address_2, bill_norm_fmt)
 
-    # Table header row
-    header_row = spacer_row + 1  # Excel row 10
-    ws.set_row(header_row - 1, 22)
+    # Spacer row 9
+    ws.set_row(8, 10)
 
-    # Column groups:
-    # Concepto B..N (2..14) => idx 1..13
-    # Costo O..S (15..19) => idx 14..18
-    # Unidades T..V (20..22) => idx 19..21
-    # Subtotal W..Z (23..26) => idx 22..25
-    ws.merge_range(header_row - 1, 1,  header_row - 1, 13, "Concepto",      th_fmt)
+    # -------- Table header row 10 (Excel) --------
+    header_row = 10
+    ws.set_row(header_row - 1, 26)
+
+    ws.merge_range(header_row - 1, 1, header_row - 1, 13, "Concepto", th_fmt)
     ws.merge_range(header_row - 1, 14, header_row - 1, 18, "Costo unitario", th_fmt)
-    ws.merge_range(header_row - 1, 19, header_row - 1, 21, "Unidades",      th_fmt)
-    ws.merge_range(header_row - 1, 22, header_row - 1, 25, "Subtotal",      th_fmt)
+    ws.merge_range(header_row - 1, 19, header_row - 1, 21, "Unidades", th_fmt)
+    ws.merge_range(header_row - 1, 22, header_row - 1, 25, "Subtotal", th_fmt)
 
-    # Items start row
-    start_items = header_row + 1  # Excel row 11
+    # -------- Items start row 11 (Excel) --------
+    start_items = 11
     items = payload.items or [ODCItem(concept="", unit_cost=0, units=0)]
-
     max_items = min(len(items), 18)
-    wrap_chars = 62
-    min_row_h = 22
+    wrap_chars = 58
+    min_row_h = 26
 
     last_item_row = start_items - 1
-    for idx, it in enumerate(items[:max_items]):
+
+    # compute sum_amount if needed
+    computed_sum = 0.0
+
+    for idx in range(max_items):
         rr = start_items + idx
+        it = items[idx]
+
         zebra = (idx % 2 == 1)
         row_fill = gray_fill if zebra else white_bg
         fill_range(ws, rr, 2, rr, 26, row_fill)
-
-        needed = row_height_for_wrapped_text(it.concept, wrap_chars, base_line_height=11.5, extra_lines=0.9)
-        ws.set_row(rr - 1, int(max(min_row_h, math.ceil(needed))))
 
         unit_cost = safe_float(it.unit_cost)
         units = safe_float(it.units)
         subtotal = safe_float(it.subtotal) if it.subtotal is not None else (unit_cost * units)
 
-        ws.merge_range(rr - 1, 1,  rr - 1, 13, it.concept, concept_g if zebra else concept_w)
-        ws.merge_range(rr - 1, 14, rr - 1, 18, unit_cost,  money_g if zebra else money_w)
-        ws.merge_range(rr - 1, 19, rr - 1, 21, units,      units_g if zebra else units_w)
-        ws.merge_range(rr - 1, 22, rr - 1, 25, subtotal,   money_g if zebra else money_w)
+        computed_sum += subtotal
+
+        # Auto-height, but keep vertical center; concept wraps.
+        needed = row_height_for_wrapped_text(it.concept, wrap_chars, base_line_height=11.0, extra_lines=0.7)
+        ws.set_row(rr - 1, int(max(min_row_h, math.ceil(needed))))
+
+        ws.merge_range(rr - 1, 1, rr - 1, 13, it.concept, concept_g if zebra else concept_w)
+        ws.merge_range(rr - 1, 14, rr - 1, 18, unit_cost, money_g if zebra else money_w)
+        ws.merge_range(rr - 1, 19, rr - 1, 21, units, units_g if zebra else units_w)
+        ws.merge_range(rr - 1, 22, rr - 1, 25, subtotal, money_g if zebra else money_w)
 
         last_item_row = rr
 
-    # Summary block (SUMA / ANTICIPO / TOTAL)
-    summary_start = last_item_row + 2  # one blank row then summary
+    # -------- Summary block (SUMA / ANTICIPO / TOTAL) --------
+    sum_amount = safe_float(payload.sum_amount) if payload.sum_amount is not None else computed_sum
+    advance_amount = safe_float(payload.advance_amount) if payload.advance_amount is not None else 0.0
+    total_due = safe_float(payload.total_due) if payload.total_due is not None else (sum_amount - advance_amount)
 
-    # Give some air
+    summary_start = last_item_row + 2  # one blank row then summary
     ws.set_row(summary_start - 1, 10)
 
-    # We'll use rows: summary_start+1, +2, +3 for the three lines
     sum_row = summary_start + 1
     adv_row = summary_start + 2
     tot_row = summary_start + 3
@@ -515,34 +500,29 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
         ws.set_row(r - 1, 22)
         fill_range(ws, r, 2, r, 26, white_bg)
 
-    # Place summary at right side similar to reference:
-    # Labels in V..X (22..24 1-based => idx 21..23)
-    # Values in Y..Z (25..26 1-based => idx 24..25)
-    # And a subtle vertical divider line between label/value (we use borders on the value cell)
-    # We'll also add a thin bottom line under each row using hline_fmt over the area.
-    # Underlines (light gray) across V..Z
-    fill_range(ws, sum_row, 22, sum_row, 26, hline_fmt)
-    fill_range(ws, adv_row, 22, adv_row, 26, hline_fmt)
-    fill_range(ws, tot_row, 22, tot_row, 26, white_bg)
+    # Underlines across T..Z
+    fill_range(ws, sum_row, 20, sum_row, 26, hline_fmt)  # T..Z
+    fill_range(ws, adv_row, 20, adv_row, 26, hline_fmt)  # T..Z
 
-    # Label merges: V..X (idx 21..23)
-    ws.merge_range(sum_row - 1, 21, sum_row - 1, 23, "SUMA:",     sum_label_fmt)
-    ws.merge_range(adv_row - 1, 21, adv_row - 1, 23, "ANTICIPO:", adv_label_fmt)
-    ws.merge_range(tot_row - 1, 21, tot_row - 1, 23, "TOTAL:",    total_label_fmt)
+    # Layout:
+    # Labels: T..V (idx 19..21)
+    # Values: W..Z (idx 22..25) -> wide merges, no ####, centered
+    ws.merge_range(sum_row - 1, 19, sum_row - 1, 21, "SUMA:", sum_label_fmt)
+    ws.merge_range(adv_row - 1, 19, adv_row - 1, 21, "ANTICIPO:", adv_label_fmt)
+    ws.merge_range(tot_row - 1, 19, tot_row - 1, 21, "TOTAL:", total_label_fmt)
 
-    # Value merges: Y..Z (idx 24..25)
-    ws.merge_range(sum_row - 1, 24, sum_row - 1, 25, safe_float(payload.sum_amount),     sum_value_fmt)
-    ws.merge_range(adv_row - 1, 24, adv_row - 1, 25, safe_float(payload.advance_amount), adv_value_fmt)
-    ws.merge_range(tot_row - 1, 24, tot_row - 1, 25, safe_float(payload.total_due),      total_value_fmt)
+    ws.merge_range(sum_row - 1, 22, sum_row - 1, 25, sum_amount, sum_value_fmt)
+    ws.merge_range(adv_row - 1, 22, adv_row - 1, 25, advance_amount, adv_value_fmt)
+    ws.merge_range(tot_row - 1, 22, tot_row - 1, 25, total_due, total_value_fmt)
 
-    # -------------------- Print settings --------------------
+    # -------- Print settings --------
     ws.set_landscape()
     ws.set_paper(9)  # A4
     ws.set_margins(left=0.25, right=0.25, top=0.35, bottom=0.35)
     ws.fit_to_pages(1, 0)
 
-    # Print area: until a bit after total
-    ws.print_area(range_a1(1, 1, tot_row + 2, 26))  # A1:Z...
+    # Print area
+    ws.print_area(range_a1(1, 1, tot_row + 3, 26))  # A1:Z...
 
     wb.close()
     return out.getvalue()

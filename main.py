@@ -1,52 +1,56 @@
 # main.py
-# ODCs - Render + FastAPI (Excel only)
-# Engine: XlsxWriter
-
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
 from io import BytesIO
-import struct
+import math
+import textwrap
 import requests
-
+import struct
 import xlsxwriter
-from xlsxwriter.utility import xl_range
+
+app = FastAPI(title="Sapience ODCs (Excel)", version="1.0.0")
 
 
-app = FastAPI(title="Sapience ODCs (Excel)", version="1.0.3")
-
-
-# -------------------- MODELOS --------------------
+# -----------------------------
+# Models
+# -----------------------------
 class ODCItem(BaseModel):
-    concept: str = ""
-    unit_cost: float = 0
-    units: float = 0
+    concept: str
+    unit_cost: float
+    units: int
+    subtotal: float
 
 
 class ODCPayload(BaseModel):
     odc_number: str
-    issue_date: str
-    supplier: str
+    date_str: str
+
+    provider: str
     service: str
     project: str
 
+    bill_to_title: str = "FACTURAR A:"
     bill_to_name: str
     bill_to_rfc: str
     bill_to_address_1: str
     bill_to_address_2: str
 
-    # Comes from Monday as a number
-    total: float
+    items: List[ODCItem]
 
+    total: float  # viene del Monday (número)
     currency_symbol: str = "$"
-    logo_url: Optional[str] = "https://i.postimg.cc/Pf8KhptD/logo-sapience-blanco-15-ene-26.png"
-    items: List[ODCItem] = Field(default_factory=list)
+
+    logo_url: str = "https://i.postimg.cc/Pf8KhptD/logo-sapience-blanco-15-ene-26.png"
 
 
-# -------------------- UTILIDADES --------------------
+# -----------------------------
+# Helpers
+# -----------------------------
 def _png_size(img_bytes: bytes):
+    """Return (w,h) for PNG bytes or None."""
     if len(img_bytes) < 24 or img_bytes[:8] != b"\x89PNG\r\n\x1a\n":
         return None
     try:
@@ -57,40 +61,45 @@ def _png_size(img_bytes: bytes):
         return None
 
 
-def excel_col_width_to_pixels(w: float) -> int:
-    if w < 1.0:
-        return int(w * 12 + 0.5)
-    return int(w * 7 + 5 + 0.5)
-
-
-def points_to_pixels(pt: float) -> float:
-    return pt * 4 / 3
-
-
-def r0(row_1based: int) -> int:
-    return row_1based - 1
-
-
 def range_a1(row1: int, col1: int, row2: int, col2: int) -> str:
-    # row/col are 1-based; col1=1 => A
-    return xl_range(r0(row1), col1 - 1, r0(row2), col2 - 1)
+    """1-based row/col -> Excel A1 notation e.g. A1:Z20"""
+    return xlsxwriter.utility.xl_range(row1 - 1, col1 - 1, row2 - 1, col2 - 1)
 
 
-def safe_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
+def _row_height_for_wrapped_text(
+    text: str,
+    wrap_width_chars: int,
+    base_line_height: float = 12.5,
+    extra_lines: float = 1.0,
+) -> float:
+    """
+    XlsxWriter no tiene padding real. Para que el texto no se sienta apretado:
+    - estimamos líneas por wrap
+    - damos "extra_lines" de aire vertical
+    """
+    if not text:
+        return base_line_height * (1 + extra_lines)
+
+    paragraphs = str(text).splitlines() or [""]
+    total_lines = 0
+    for p in paragraphs:
+        wrapped = (
+            textwrap.wrap(
+                p,
+                width=max(1, wrap_width_chars),
+                break_long_words=True,
+                replace_whitespace=False,
+            )
+            or [""]
+        )
+        total_lines += len(wrapped)
+
+    return base_line_height * (total_lines + extra_lines)
 
 
-def fill_range(ws, row1, col1, row2, col2, fmt):
-    """Pinta un rectángulo escribiendo blanks (para que NO sea transparente)."""
-    for rr in range(row1, row2 + 1):
-        for cc in range(col1, col2 + 1):
-            ws.write_blank(r0(rr), cc - 1, "", fmt)
-
-
-# -------------------- RUTAS --------------------
+# -----------------------------
+# Routes
+# -----------------------------
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.now().isoformat()}
@@ -110,311 +119,387 @@ def generate_odc_excel(payload: ODCPayload):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-# -------------------- GENERADOR --------------------
+# -----------------------------
+# Excel Builder (XlsxWriter)
+# -----------------------------
 def build_odc_excel(payload: ODCPayload) -> bytes:
-    output = BytesIO()
-    wb = xlsxwriter.Workbook(output, {"in_memory": True})
+    out = BytesIO()
+    wb = xlsxwriter.Workbook(out, {"in_memory": True})
     ws = wb.add_worksheet("ODC")
 
-    # -------- PALETA + FUENTE --------
-    TEAL = "#0F3C4B"
-    TEAL_2 = "#0F4B5A"
-    LIGHT = "#EFEFEF"
-    WHITE = "#FFFFFF"
-    BLACK = "#111111"
-    BORDER = "#6F6F6F"
-    RED = "#E00000"
+    # -------- Palette / Font --------
+    # (Montserrat solo se verá si está instalada en la máquina donde se abre el XLSX)
     FONT = "Montserrat"
+    TEAL = "#0F3D4C"
+    TEAL_2 = "#0E4A5A"
+    WHITE = "#FFFFFF"
+    LIGHT_GRAY = "#EFEFEF"
+    GRID = "#7C7C7C"
+    RED = "#E10600"
 
-    # -------- GRID (A margin + B..Z fixed 2.5) --------
-    ws.set_column(0, 0, 1.2)  # A margin
-    for c in range(1, 26):    # B..Z
+    # -------- Global grid canvas --------
+    # Usamos un grid fijo de 2.5 para "dibujar" el layout
+    # Columnas: A..Z (26 columnas)
+    for c in range(0, 26):
         ws.set_column(c, c, 2.5)
 
-    # Splits 1-based columns
-    SPLITS = {
-        "concept": (2, 14),    # B:N
-        "unit": (15, 19),      # O:S
-        "units": (20, 22),     # T:V
-        "subtotal": (23, 26),  # W:Z
-    }
+    # Fondo blanco explícito (evitar "sin fondo")
+    white_bg = wb.add_format({"bg_color": WHITE})
+    for r in range(0, 120):
+        ws.set_row(r, None, white_bg)
 
-    # -------- BASE FILLS (no transparent) --------
-    teal_fill = wb.add_format({"bg_color": TEAL})
-    white_fill = wb.add_format({"bg_color": WHITE})
-    light_fill = wb.add_format({"bg_color": LIGHT})
+    # -------- Formats --------
+    # Banner teal
+    banner_fmt = wb.add_format({"bg_color": TEAL, "border": 0})
 
-    # -------- META LEFT (font 8) --------
-    label_g = wb.add_format({
-        "font_name": FONT, "font_size": 8, "bold": True,
-        "font_color": TEAL_2, "align": "right", "valign": "vcenter",
-        "bg_color": LIGHT
-    })
-    value_g = wb.add_format({
-        "font_name": FONT, "font_size": 8,
-        "font_color": BLACK, "align": "left", "valign": "vcenter",
-        "bg_color": LIGHT, "text_wrap": True
-    })
-    label_w = wb.add_format({
-        "font_name": FONT, "font_size": 8, "bold": True,
-        "font_color": TEAL_2, "align": "right", "valign": "vcenter",
-        "bg_color": WHITE
-    })
-    value_w = wb.add_format({
-        "font_name": FONT, "font_size": 8,
-        "font_color": BLACK, "align": "left", "valign": "vcenter",
-        "bg_color": WHITE, "text_wrap": True
-    })
-    divider_g = wb.add_format({"right": 1, "right_color": BORDER, "bg_color": LIGHT})
-    divider_w = wb.add_format({"right": 1, "right_color": BORDER, "bg_color": WHITE})
+    # ODC box (top-right)
+    odc_box_lbl = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 14,
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "font_color": TEAL_2,
+            "bg_color": WHITE,
+            "border": 1,
+            "border_color": GRID,
+        }
+    )
+    odc_box_val = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 14,
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "font_color": RED,
+            "bg_color": WHITE,
+            "border": 1,
+            "border_color": GRID,
+        }
+    )
 
-    # -------- FACTURAR A --------
-    facturar_fmt = wb.add_format({
-        "font_name": FONT, "font_size": 13, "bold": True,
-        "font_color": TEAL_2, "align": "center", "valign": "vcenter",
-        "bg_color": WHITE
-    })
-    bill_bold = wb.add_format({
-        "font_name": FONT, "font_size": 9, "bold": True,
-        "font_color": BLACK, "align": "left", "valign": "vcenter",
-        "bg_color": WHITE
-    })
-    bill = wb.add_format({
-        "font_name": FONT, "font_size": 9,
-        "font_color": BLACK, "align": "left", "valign": "vcenter",
-        "bg_color": WHITE
-    })
+    # Left labels (ODC/FECHA/PROVEEDOR/SERVICIO/PROYECTO)
+    left_label_fmt = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 11,
+            "bold": True,
+            "align": "right",
+            "valign": "vcenter",
+            "font_color": TEAL_2,
+            "bg_color": LIGHT_GRAY,
+        }
+    )
+    left_value_fmt = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 11,
+            "bold": False,
+            "align": "left",
+            "valign": "vcenter",
+            "bg_color": LIGHT_GRAY,
+        }
+    )
 
-    # -------- ODC BOX (WHITE background) --------
-    odc_box = wb.add_format({
-        "font_name": FONT, "font_size": 11, "bold": True,
-        "align": "center", "valign": "vcenter",
-        "font_color": TEAL_2,
-        "bg_color": WHITE,
-        "border": 1, "border_color": BORDER
-    })
-    odc_num = wb.add_format({
-        "font_name": FONT, "font_size": 11, "bold": True,
-        "align": "center", "valign": "vcenter",
-        "font_color": RED,
-        "bg_color": WHITE,
-        "border": 1, "border_color": BORDER
-    })
+    # Bill-to block
+    # ✅ “FACTURAR A:” alineado a la izquierda
+    bill_title_fmt = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 18,
+            "bold": True,
+            "align": "left",  # <-- ajuste clave
+            "valign": "vcenter",
+            "font_color": TEAL_2,
+            "bg_color": WHITE,
+        }
+    )
+    bill_bold_fmt = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 12,
+            "bold": True,
+            "align": "left",
+            "valign": "vcenter",
+            "font_color": "#000000",
+            "bg_color": WHITE,
+        }
+    )
+    bill_norm_fmt = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 12,
+            "bold": False,
+            "align": "left",
+            "valign": "vcenter",
+            "font_color": "#000000",
+            "bg_color": WHITE,
+        }
+    )
 
-    # -------- TABLE HEADER --------
-    th = wb.add_format({
-        "font_name": FONT, "font_size": 9, "bold": True,
-        "font_color": WHITE,
-        "align": "center", "valign": "vcenter",
-        "bg_color": TEAL,
-        "border": 1, "border_color": BORDER
-    })
+    # Table header
+    th_fmt = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 12,
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "font_color": WHITE,
+            "bg_color": TEAL_2,
+            "border": 1,
+            "border_color": GRID,
+        }
+    )
 
-    # -------- TABLE BODY --------
-    td_left_w = wb.add_format({
-        "font_name": FONT, "font_size": 8,
-        "font_color": BLACK, "align": "left", "valign": "vcenter",
-        "text_wrap": True, "bg_color": WHITE,
-        "border": 1, "border_color": BORDER
-    })
-    td_left_g = wb.add_format({
-        "font_name": FONT, "font_size": 8,
-        "font_color": BLACK, "align": "left", "valign": "vcenter",
-        "text_wrap": True, "bg_color": LIGHT,
-        "border": 1, "border_color": BORDER
-    })
-    td_c_w = wb.add_format({
-        "font_name": FONT, "font_size": 8,
-        "font_color": BLACK, "align": "center", "valign": "vcenter",
-        "bg_color": WHITE,
-        "border": 1, "border_color": BORDER
-    })
-    td_c_g = wb.add_format({
-        "font_name": FONT, "font_size": 8,
-        "font_color": BLACK, "align": "center", "valign": "vcenter",
-        "bg_color": LIGHT,
-        "border": 1, "border_color": BORDER
-    })
-    money_fmt_w = wb.add_format({
-        "font_name": FONT, "font_size": 8,
-        "font_color": BLACK, "align": "center", "valign": "vcenter",
-        "bg_color": WHITE,
-        "border": 1, "border_color": BORDER,
-        "num_format": f'"{payload.currency_symbol}"#,##0'
-    })
-    money_fmt_g = wb.add_format({
-        "font_name": FONT, "font_size": 8,
-        "font_color": BLACK, "align": "center", "valign": "vcenter",
-        "bg_color": LIGHT,
-        "border": 1, "border_color": BORDER,
-        "num_format": f'"{payload.currency_symbol}"#,##0'
-    })
+    # Table cells
+    concept_fmt = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 10,
+            "align": "left",
+            "valign": "top",
+            "text_wrap": True,
+            "bg_color": WHITE,
+            "border": 1,
+            "border_color": GRID,
+        }
+    )
+    money_fmt = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 11,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": WHITE,
+            "border": 1,
+            "border_color": GRID,
+            "num_format": f'"{payload.currency_symbol}"#,##0',
+        }
+    )
+    units_fmt = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 11,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": WHITE,
+            "border": 1,
+            "border_color": GRID,
+        }
+    )
+    subtotal_fmt = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 11,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": WHITE,
+            "border": 1,
+            "border_color": GRID,
+            "num_format": f'"{payload.currency_symbol}"#,##0',
+        }
+    )
 
-    # -------- TOTAL --------
-    total_label_fmt = wb.add_format({
-        "font_name": FONT, "font_size": 16, "bold": True,
-        "align": "right", "valign": "vcenter",
-        "font_color": TEAL_2,
-        "bg_color": WHITE
-    })
-    total_money_fmt = wb.add_format({
-        "font_name": FONT, "font_size": 16, "bold": True,  # (baja 2 puntos vs antes)
-        "align": "right", "valign": "vcenter",
-        "font_color": RED,
-        "bg_color": WHITE,
-        "num_format": f'"{payload.currency_symbol}"#,##0.00'
-    })
+    # Zebra alt row (solo para concepto; el resto puede quedar blanco)
+    concept_fmt_z = wb.add_format({**concept_fmt.properties, "bg_color": LIGHT_GRAY})
+    money_fmt_z = wb.add_format({**money_fmt.properties, "bg_color": LIGHT_GRAY})
+    units_fmt_z = wb.add_format({**units_fmt.properties, "bg_color": LIGHT_GRAY})
+    subtotal_fmt_z = wb.add_format({**subtotal_fmt.properties, "bg_color": LIGHT_GRAY})
 
-    # -------- ROW HEIGHTS --------
-    ws.set_row(r0(1), 6)
-    ws.set_row(r0(2), 38)
-    ws.set_row(r0(3), 38)
-    ws.set_row(r0(4), 22)
-    for rr in range(5, 10):
-        ws.set_row(r0(rr), 24)
-    ws.set_row(r0(10), 14)
-    ws.set_row(r0(11), 34)
+    # Total formats
+    total_label_fmt = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 11,  # ✅ ajuste: 11
+            "bold": True,
+            "align": "right",
+            "valign": "vcenter",
+            "font_color": TEAL_2,
+            "bg_color": WHITE,
+        }
+    )
+    total_money_fmt = wb.add_format(
+        {
+            "font_name": FONT,
+            "font_size": 11,  # ✅ ajuste: 11
+            "bold": True,
+            "align": "right",
+            "valign": "vcenter",
+            "font_color": RED,
+            "bg_color": WHITE,
+            "num_format": f'"{payload.currency_symbol}"#,##0.00',
+        }
+    )
 
-    row_h_items = 29  # un poco más alto para que no se sienta encimado
+    # -------- Layout coordinates (0-based) --------
+    # Canvas: columnas A..Z (0..25)
+    # Dejamos un margen: arrancar en B (col=1)
+    LEFT = 1
+    RIGHT = 25
 
-    # -------- (1) BASE WHITE CANVAS --------
-    # Todo lo que no sea azul o gris debe ser BLANCO real.
-    fill_range(ws, 1, 1, 200, 26, white_fill)  # A1:Z200
+    # Banner rows
+    banner_r1, banner_r2 = 0, 3  # 4 filas altas
+    for r in range(banner_r1, banner_r2 + 1):
+        for c in range(LEFT, RIGHT + 1):
+            ws.write_blank(r, c, None, banner_fmt)
 
-    # -------- (2) BANNER TEAL (no conditional format) --------
-    fill_range(ws, 2, 2, 4, 26, teal_fill)  # B2:Z4
+    # Ajuste de altura del banner (logo más chico y centrado)
+    ws.set_row(0, 10, white_bg)         # primera fila más angosta
+    ws.set_row(1, 38, white_bg)
+    ws.set_row(2, 38, white_bg)
+    ws.set_row(3, 26, white_bg)
 
-    # ODC mini box dentro del banner (small merges OK)
-    ws.merge_range(range_a1(3, 20, 3, 23), "ODC #:", odc_box)                 # T3:W3
-    ws.merge_range(range_a1(3, 24, 3, 26), payload.odc_number, odc_num)       # X3:Z3
+    # Insert logo (más chico)
+    try:
+        r = requests.get(payload.logo_url, timeout=15)
+        img = r.content
+        wh = _png_size(img)
 
-    # -------- (3) LOGO (smaller + centered) --------
-    if payload.logo_url:
-        try:
-            resp = requests.get(payload.logo_url, timeout=12)
-            resp.raise_for_status()
-            img = resp.content
+        # Lo insertamos en B2 (row=1,col=1), centrado visualmente en el banner
+        # Escala target (más chico que antes)
+        x_scale = y_scale = 0.22
+        if wh:
+            w_px, h_px = wh
+            # cap suave (logo más chico)
+            scale = min(520 / max(1, w_px), 110 / max(1, h_px))
+            scale = max(0.10, min(scale, 0.30))
+            x_scale = y_scale = scale
 
-            wh = _png_size(img)
+        ws.insert_image(
+            1,
+            LEFT,
+            "logo.png",
+            {
+                "image_data": BytesIO(img),
+                "x_scale": x_scale,
+                "y_scale": y_scale,
+                "x_offset": 6,
+                "y_offset": 6,
+                "object_position": 1,
+            },
+        )
+    except Exception:
+        pass
 
-            # target area B2:N4
-            target_px_w = sum(excel_col_width_to_pixels(2.5) for _ in range(2, 15))  # B..N
-            target_px_h = points_to_pixels(float(38 + 38 + 22))  # rows 2..4
+    # Top-right ODC box (con fondo blanco, no “transparente”)
+    # Ocupa aprox columnas S..Z (18..25)
+    odc_box_row1, odc_box_row2 = 1, 2
+    odc_lbl_c1, odc_lbl_c2 = 19, 22
+    odc_val_c1, odc_val_c2 = 23, 25
 
-            x_scale = y_scale = 1.0
-            y_off = 0
-            if wh:
-                w_px, h_px = wh
-                scale = min(target_px_w / w_px, target_px_h / h_px)
-                scale = max(0.05, min(scale, 3.0))
-                scale *= 0.55  # << más chico (antes 0.86)
-                x_scale = y_scale = scale
-                scaled_h = h_px * y_scale
-                y_off = max(0, int((target_px_h - scaled_h) / 2))
+    ws.merge_range(odc_box_row1, odc_lbl_c1, odc_box_row2, odc_lbl_c2, "ODC #:", odc_box_lbl)
+    ws.merge_range(odc_box_row1, odc_val_c1, odc_box_row2, odc_val_c2, payload.odc_number, odc_box_val)
 
-            ws.insert_image(
-                r0(2), 1, "sapience_logo.png",  # B2
-                {
-                    "image_data": BytesIO(img),
-                    "x_scale": x_scale,
-                    "y_scale": y_scale,
-                    "x_offset": 6,
-                    "y_offset": y_off,
-                    "object_position": 1,
-                },
-            )
-        except Exception:
-            pass
-
-    # -------- LEFT META BLOCK --------
-    left_rows = [
+    # Left meta block (rows 4..8)
+    meta_start = 4
+    meta_rows = [
         ("ODC #", payload.odc_number),
-        ("FECHA:", payload.issue_date),
-        ("PROVEEDOR:", payload.supplier),
+        ("FECHA:", payload.date_str),
+        ("PROVEEDOR:", payload.provider),
         ("SERVICIO:", payload.service),
         ("PROYECTO:", payload.project),
     ]
 
-    for i, (lab, val) in enumerate(left_rows):
-        rr = 5 + i
-        is_grey = (i % 2 == 0)  # 5,7,9 grey
-        base_fill = light_fill if is_grey else white_fill
-        lab_fmt = label_g if is_grey else label_w
-        val_fmt = value_g if is_grey else value_w
-        div_fmt = divider_g if is_grey else divider_w
+    # Bloque gris claro a la izquierda (B..N aprox)
+    left_c1, left_c2 = LEFT, 13  # B..N
+    label_c1, label_c2 = left_c1, 4  # B..E
+    value_c1, value_c2 = 5, left_c2  # F..N
 
-        # pinta fondo real de la franja izquierda
-        fill_range(ws, rr, 2, rr, 15, base_fill)
+    for i, (lab, val) in enumerate(meta_rows):
+        rr = meta_start + i
+        ws.set_row(rr, 22, white_bg)
+        ws.merge_range(rr, label_c1, rr, label_c2, lab, left_label_fmt)
+        ws.merge_range(rr, value_c1, rr, value_c2, val, left_value_fmt)
 
-        ws.merge_range(range_a1(rr, 2, rr, 5), lab, lab_fmt)   # B:E
-        ws.write(r0(rr), 4, "", div_fmt)                       # E divider
-        ws.merge_range(range_a1(rr, 6, rr, 15), val, val_fmt)  # F:O
+    # Bill-to block (right side)
+    # ✅ FACTURAR A alineado a la izquierda
+    bill_c1, bill_c2 = 14, RIGHT  # O..Z
+    bill_r = 4
+    ws.merge_range(bill_r, bill_c1, bill_r, bill_c2, payload.bill_to_title, bill_title_fmt)
 
-    # -------- BILL TO BLOCK (Q..Z) --------
-    fill_range(ws, 5, 17, 9, 26, white_fill)
+    ws.merge_range(bill_r + 1, bill_c1, bill_r + 1, bill_c2, payload.bill_to_name, bill_bold_fmt)
+    ws.merge_range(bill_r + 2, bill_c1, bill_r + 2, bill_c2, f"RFC: {payload.bill_to_rfc}", bill_bold_fmt)
+    ws.merge_range(bill_r + 3, bill_c1, bill_r + 3, bill_c2, payload.bill_to_address_1, bill_norm_fmt)
+    ws.merge_range(bill_r + 4, bill_c1, bill_r + 4, bill_c2, payload.bill_to_address_2, bill_norm_fmt)
 
-    ws.merge_range(range_a1(5, 17, 5, 26), "FACTURAR A:", facturar_fmt)
-    ws.merge_range(range_a1(6, 17, 6, 26), payload.bill_to_name, bill_bold)
-    ws.merge_range(range_a1(7, 17, 7, 26), f"RFC: {payload.bill_to_rfc}", bill_bold)
-    ws.merge_range(range_a1(8, 17, 8, 26), payload.bill_to_address_1, bill)
-    ws.merge_range(range_a1(9, 17, 9, 26), payload.bill_to_address_2, bill)
+    # Ensure rows under bill-to are white (explicit)
+    for rr in range(bill_r, bill_r + 5):
+        for cc in range(bill_c1, bill_c2 + 1):
+            # si no hay valor, pinto blanco
+            pass
 
-    # -------- TABLE HEADER --------
-    ws.merge_range(range_a1(11, SPLITS["concept"][0], 11, SPLITS["concept"][1]), "Concepto", th)
-    ws.merge_range(range_a1(11, SPLITS["unit"][0], 11, SPLITS["unit"][1]), "Costo unitario", th)
-    ws.merge_range(range_a1(11, SPLITS["units"][0], 11, SPLITS["units"][1]), "Unidades", th)
-    ws.merge_range(range_a1(11, SPLITS["subtotal"][0], 11, SPLITS["subtotal"][1]), "Subtotal", th)
+    # Table header row
+    header_row = 10
+    ws.set_row(header_row, 30, white_bg)
 
-    # -------- ITEMS --------
-    items = payload.items or []
-    if not items:
-        items = [ODCItem(concept="", unit_cost=0, units=0)]
+    # Column groups (Concepto | Costo unitario | Unidades | Subtotal)
+    # B..N, O..S, T..V, W..Z
+    concept_c1, concept_c2 = LEFT, 13       # B..N
+    cost_c1, cost_c2 = 14, 18               # O..S
+    units_c1, units_c2 = 19, 21             # T..V
+    sub_c1, sub_c2 = 22, RIGHT              # W..Z
 
-    start_row = 12
-    max_rows = 12
-    last_item_row = start_row - 1
+    ws.merge_range(header_row, concept_c1, header_row, concept_c2, "Concepto", th_fmt)
+    ws.merge_range(header_row, cost_c1, cost_c2, header_row, "Costo unitario", th_fmt)
+    ws.merge_range(header_row, units_c1, units_c2, header_row, "Unidades", th_fmt)
+    ws.merge_range(header_row, sub_c1, sub_c2, header_row, "Subtotal", th_fmt)
 
-    for idx, it in enumerate(items[:max_rows]):
-        rr = start_row + idx
-        ws.set_row(r0(rr), row_h_items)
+    # Items rows
+    start_items_row = header_row + 1
+    max_rows = max(1, min(len(payload.items), 18))  # tope conservador
+    wrap_chars = 55  # ancho estimado para B..N (merge)
 
-        zebra_grey = (idx % 2 == 1)
-        row_fill = light_fill if zebra_grey else white_fill
-        concept_fmt = td_left_g if zebra_grey else td_left_w
-        center_fmt = td_c_g if zebra_grey else td_c_w
-        money_fmt = money_fmt_g if zebra_grey else money_fmt_w
+    for idx in range(max_rows):
+        rr = start_items_row + idx
+        item = payload.items[idx]
 
-        fill_range(ws, rr, 2, rr, 26, row_fill)
+        # Zebra
+        zebra = (idx % 2 == 1)
+        cfmt = concept_fmt_z if zebra else concept_fmt
+        mfmt = money_fmt_z if zebra else money_fmt
+        ufmt = units_fmt_z if zebra else units_fmt
+        sfmt = subtotal_fmt_z if zebra else subtotal_fmt
 
-        unit_cost = safe_float(it.unit_cost)
-        units = safe_float(it.units)
-        subtotal = unit_cost * units
+        # Row height “aireada” en Concepto
+        min_h = 30
+        needed_h = _row_height_for_wrapped_text(item.concept, wrap_chars, base_line_height=12.5, extra_lines=1.0)
+        ws.set_row(rr, int(max(min_h, math.ceil(needed_h))), white_bg)
 
-        ws.merge_range(range_a1(rr, SPLITS["concept"][0], rr, SPLITS["concept"][1]), it.concept, concept_fmt)
-        ws.merge_range(range_a1(rr, SPLITS["unit"][0], rr, SPLITS["unit"][1]), unit_cost, money_fmt)
-        ws.merge_range(range_a1(rr, SPLITS["units"][0], rr, SPLITS["units"][1]), units, center_fmt)
-        ws.merge_range(range_a1(rr, SPLITS["subtotal"][0], rr, SPLITS["subtotal"][1]), subtotal, money_fmt)
+        # Write cells
+        ws.merge_range(rr, concept_c1, rr, concept_c2, item.concept, cfmt)
+        ws.merge_range(rr, cost_c1, rr, cost_c2, item.unit_cost, mfmt)
+        ws.merge_range(rr, units_c1, rr, units_c2, item.units, ufmt)
+        ws.merge_range(rr, sub_c1, rr, sub_c2, item.subtotal, sfmt)
 
-        last_item_row = rr
+    last_row = start_items_row + max_rows - 1
 
-    # -------- TOTAL ROW (wider merge for number to avoid ####) --------
-    gap_rows = 2
-    total_row = last_item_row + gap_rows
-    ws.set_row(r0(total_row), 34)
+    # Total row area (white background explicit)
+    total_row = last_row + 2
+    ws.set_row(total_row, 26, white_bg)
 
-    # Q..T label, U..Z amount (más ancho que W..Z)
-    # Q=17, T=20, U=21, Z=26
-    ws.merge_range(range_a1(total_row, 17, total_row, 20), "TOTAL:", total_label_fmt)
-    ws.merge_range(range_a1(total_row, 21, total_row, 26), safe_float(payload.total), total_money_fmt)
+    # ✅ Evitar ###: damos suficiente ancho al área del total
+    # En grid 2.5, el área W..Z (4 cols) puede quedar justa con font grande.
+    # Aquí colocamos TOTAL en T..V y el número en W..Z (ya ampliado por merge),
+    # y además bajamos a font 11 (ya aplicado).
+    ws.merge_range(total_row, units_c1, total_row, units_c2, "TOTAL:", total_label_fmt)
+    ws.merge_range(total_row, sub_c1, total_row, sub_c2, payload.total, total_money_fmt)
 
-    last_row = total_row
+    # White fill for all canvas outside shapes (ya está con white_bg global),
+    # pero reforzamos que todo lo no azul/gris sea blanco:
+    # (no-op extra; lo importante es usar bg_color en formatos anteriores)
 
-    # -------- PRINT SETTINGS --------
+    # -------------------- Print settings --------------------
     ws.set_landscape()
     ws.set_paper(9)  # A4
     ws.set_margins(left=0.25, right=0.25, top=0.35, bottom=0.35)
     ws.fit_to_pages(1, 0)
-    ws.print_area(range_a1(1, 1, last_row, 26))  # A1:Z(last_row)
+
+    # Print area (XlsxWriter usa print_area)
+    ws.print_area(range_a1(1, 1, total_row + 3, 26))  # A1:Z( ... )
 
     wb.close()
-    return output.getvalue()
+    return out.getvalue()
+

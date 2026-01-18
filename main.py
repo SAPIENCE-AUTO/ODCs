@@ -57,7 +57,7 @@ class ODCPayload(BaseModel):
     currency_symbol: str = "$"
 
     # Logo
-    logo_url: Optional[str] = "https://i.postimg.cc/Pf8KhptD/logo-sapience-blanco-15-ene-26.png"
+    logo_url: Optional[str] = "https://i.postimg.cc/8CxrRbft/logo-sapience-blanco-alargado.png"
 
 
 # -----------------------------

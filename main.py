@@ -1,7 +1,7 @@
 # main.py
 # Sapience ODCs — Render + FastAPI — Excel only (XlsxWriter)
 # v1.0.6 (patched-final) + Terms page
-# - Adds: Notes/Terms on Page 2 (2 columns), forced page break
+# - Adds: Notes/Terms on Page 2 (NOW 1 column), forced page break
 # - Does NOT change existing layout/typography, only appends
 
 from fastapi import FastAPI
@@ -148,18 +148,21 @@ def add_terms_page(
     GRID_LIGHT: str,
 ):
     """
-    Adds Page 2: TERMS_TITLE + 2 columns of clauses.
+    Adds Page 2: TERMS_TITLE + 1 column of clauses (TERMS_LEFT + TERMS_RIGHT).
     Minimal: uses existing palette and Montserrat.
     Returns last row used (1-based).
     """
     # Force a page break so this starts on Page 2 in PDF export
     ws.set_h_pagebreaks([start_row - 1])
 
-    # Formats
+    # ✅ Combine both columns into one stream (leave terms.py unchanged)
+    ALL_TERMS = (TERMS_LEFT or []) + (TERMS_RIGHT or [])
+
+    # Formats (smaller body text to avoid cutting)
     title_fmt = wb.add_format({
         "font_name": FONT, "font_size": 10, "bold": True,
-        "align": "left", "valign": "vcenter",
-        "font_color": TEAL_2, "bg_color": "#FFFFFF",
+        "align": "center", "valign": "vcenter",
+        "font_color": BLACK, "bg_color": "#FFFFFF",
     })
     section_hdr = wb.add_format({
         "font_name": FONT, "font_size": 8, "bold": True,
@@ -167,73 +170,57 @@ def add_terms_page(
         "font_color": BLACK, "bg_color": "#FFFFFF",
     })
     bullet_fmt = wb.add_format({
-        "font_name": FONT, "font_size": 8,
+        "font_name": FONT, "font_size": 7,  # ✅ smaller
         "align": "left", "valign": "top",
         "font_color": BLACK, "bg_color": "#FFFFFF",
         "text_wrap": True,
     })
 
-    # Light vertical divider between columns (optional, subtle)
-    divider_fmt = wb.add_format({"bg_color": "#FFFFFF", "left": 1, "left_color": GRID_LIGHT})
-
-    # Column ranges (A..Z is 1..26; we paint within B..Z like your layout)
-    # Left text:  B..M (cols 2..13)
-    # Divider:    N    (col 14) subtle border
-    # Right text: O..Z (cols 15..26)
-    LEFT_C1, LEFT_C2 = 2, 13
-    DIV_COL = 14
-    RIGHT_C1, RIGHT_C2 = 15, 26
+    # Single column range (B..Z)
+    COL1, COL2 = 2, 26
 
     # Title row
     rr = start_row
     ws.set_row(rr - 1, 22)
     fill_range(ws, rr, 2, rr, 26, white_bg)
-    ws.merge_range(rr - 1, LEFT_C1 - 1, rr - 1, RIGHT_C2 - 1, TERMS_TITLE, title_fmt)
+    ws.merge_range(rr - 1, COL1 - 1, rr - 1, COL2 - 1, TERMS_TITLE, title_fmt)
     rr += 2
 
-    # Helper to write a column (sections) into B..M or O..Z
-    def write_column(col1: int, col2: int, sections):
-        nonlocal rr
-        # We'll write each section sequentially, but keep rr separate per column by returning end row
-        r_local = rr
+    # Paint a clean white area to avoid leftovers
+    fill_range(ws, rr, 2, rr + 260, 26, white_bg)
 
-        for (hdr, bullets) in sections:
-            # Header
-            ws.set_row(r_local - 1, 18)
-            ws.merge_range(r_local - 1, col1 - 1, r_local - 1, col2 - 1, hdr, section_hdr)
-            r_local += 1
+    # Wider wrap since it's one big merged column
+    # (B..Z across uniform 2.5 width columns)
+    WRAP_WIDTH = 150
 
-            # Bullets (wrapped)
-            for b in bullets:
-                wrapped_lines = _wrap_lines(f"– {b}", width=72)  # approximate to fit merged cells
-                # Put the paragraph in a single merged row, with height to fit
-                text = "\n".join(wrapped_lines)
-                h = row_height_for_wrapped_text(text, wrap_width_chars=72, base_line_height=11.0, extra_lines=0.7)
-                ws.set_row(r_local - 1, int(max(18, math.ceil(h))))
-                ws.merge_range(r_local - 1, col1 - 1, r_local - 1, col2 - 1, text, bullet_fmt)
-                r_local += 1
+    for (hdr, bullets) in ALL_TERMS:
+        # Header
+        ws.set_row(rr - 1, 16)
+        ws.merge_range(rr - 1, COL1 - 1, rr - 1, COL2 - 1, hdr, section_hdr)
+        rr += 1
 
-            # Spacer
-            ws.set_row(r_local - 1, 10)
-            r_local += 1
+        # Bullets
+        for b in bullets:
+            text = f"– {b}"
+            wrapped_lines = _wrap_lines(text, width=WRAP_WIDTH)
+            merged_text = "\n".join(wrapped_lines)
 
-        return r_local
+            # Height tuned for smaller font
+            h = row_height_for_wrapped_text(
+                merged_text,
+                wrap_width_chars=WRAP_WIDTH,
+                base_line_height=9.0,
+                extra_lines=0.9,
+            )
+            ws.set_row(rr - 1, int(max(14, math.ceil(h))))
+            ws.merge_range(rr - 1, COL1 - 1, rr - 1, COL2 - 1, merged_text, bullet_fmt)
+            rr += 1
 
-    # We need both columns to start at same row, then take the max end-row
-    rr_col_start = rr
+        # Spacer
+        ws.set_row(rr - 1, 8)
+        rr += 1
 
-    # Paint a clean white area first (so no weird leftovers)
-    fill_range(ws, rr_col_start, 2, rr_col_start + 200, 26, white_bg)
-    # Paint divider column with subtle left border (optional)
-    for r in range(rr_col_start, rr_col_start + 200):
-        ws.write_blank(r - 1, DIV_COL - 1, "", divider_fmt)
-
-    end_left = write_column(LEFT_C1, LEFT_C2, TERMS_LEFT)
-    end_right = write_column(RIGHT_C1, RIGHT_C2, TERMS_RIGHT)
-
-    rr_end = max(end_left, end_right)
-
-    return rr_end
+    return rr
 
 
 # -----------------------------
@@ -601,7 +588,7 @@ def build_odc_excel(payload: ODCPayload) -> bytes:
     ws.merge_range(adv_row - 1, 22, adv_row - 1, 25, advance_amount, adv_value_fmt)
     ws.merge_range(tot_row - 1, 22, tot_row - 1, 25, total_due, total_value_fmt)
 
-    # ✅ NEW: Terms on Page 2 (start after some spacing)
+    # ✅ Terms on Page 2 (start after some spacing)
     terms_start_row = tot_row + 6
     terms_end_row = add_terms_page(
         ws,

@@ -67,14 +67,6 @@ TERMS_LEFT = [
         "Comunicación y soporte",
         [
             "Para dudas, aclaraciones o seguimiento de pagos, el proveedor deberá comunicarse exclusivamente al correo: admin@sapience.com.mx",
-        ],
-    ),
-]
-
-TERMS_RIGHT = [
-    (
-        "",  # bloque suelto
-        [
             "Los consultores del proyecto no podrán autorizar pagos, modificaciones de alcance ni ajustes de tarifas.",
         ],
     ),

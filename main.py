@@ -190,7 +190,6 @@ def add_terms_page(
     fill_range(ws, rr, 2, rr + 260, 26, white_bg)
 
     # Wider wrap since it's one big merged column
-    # (B..Z across uniform 2.5 width columns)
     WRAP_WIDTH = 150
 
     for (hdr, bullets) in ALL_TERMS:
@@ -201,19 +200,18 @@ def add_terms_page(
 
         # Bullets
         for b in bullets:
+            # ✅ NO metemos saltos de línea manuales; dejamos que Excel haga el wrap
             text = f"– {b}"
-            wrapped_lines = _wrap_lines(text, width=WRAP_WIDTH)
-            merged_text = "\n".join(wrapped_lines)
 
-            # Height tuned for smaller font
+            # Height tuned for smaller font (estima wrap sin \n)
             h = row_height_for_wrapped_text(
-                merged_text,
+                text,
                 wrap_width_chars=WRAP_WIDTH,
                 base_line_height=9.0,
                 extra_lines=0.9,
             )
             ws.set_row(rr - 1, int(max(14, math.ceil(h))))
-            ws.merge_range(rr - 1, COL1 - 1, rr - 1, COL2 - 1, merged_text, bullet_fmt)
+            ws.merge_range(rr - 1, COL1 - 1, rr - 1, COL2 - 1, text, bullet_fmt)
             rr += 1
 
         # Spacer

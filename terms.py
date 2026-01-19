@@ -1,6 +1,7 @@
 # terms.py
-# Notas y condiciones de la Orden de Compra – Sapience
-# Estructurado para render en 2 columnas (página 2 del Excel / PDF)
+# Sapience ODC - Terms & Conditions (2-column layout)
+
+TERMS_TITLE = "NOTAS Y CONDICIONES DE LA ORDEN DE COMPRA"
 
 TERMS_LEFT = [
     (
@@ -62,13 +63,18 @@ TERMS_LEFT = [
             "En caso de manejar información personal de participantes, usuarios o clientes, el proveedor deberá contar con procedimientos adecuados de protección de datos y cumplir con la legislación vigente en materia de privacidad.",
         ],
     ),
-]
-
-TERMS_RIGHT = [
     (
         "Comunicación y soporte",
         [
             "Para dudas, aclaraciones o seguimiento de pagos, el proveedor deberá comunicarse exclusivamente al correo: admin@sapience.com.mx",
+        ],
+    ),
+]
+
+TERMS_RIGHT = [
+    (
+        "",  # bloque suelto
+        [
             "Los consultores del proyecto no podrán autorizar pagos, modificaciones de alcance ni ajustes de tarifas.",
         ],
     ),
@@ -95,8 +101,7 @@ TERMS_RIGHT = [
     (
         "Relación comercial independiente",
         [
-            "La presente ODC no genera relación laboral, subordinación o exclusividad entre el proveedor y Sapience.",
-            "El proveedor actúa de manera independiente y será responsable de las obligaciones fiscales que deriven de su actividad.",
+            "La presente ODC no genera relación laboral, subordinación o exclusividad entre el proveedor y Sapience. El proveedor actúa de manera independiente y será responsable de las obligaciones fiscales que deriven de su actividad.",
         ],
     ),
     (
@@ -113,3 +118,4 @@ TERMS_RIGHT = [
         ],
     ),
 ]
+

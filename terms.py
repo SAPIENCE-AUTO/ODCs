@@ -1,5 +1,6 @@
 # terms.py
-# Sapience ODC - Terms & Conditions (2-column layout)
+# Sapience ODC - Terms & Conditions
+# Single-column content (rendered as 1 column in main.py)
 
 TERMS_TITLE = "NOTAS Y CONDICIONES DE LA ORDEN DE COMPRA"
 
@@ -14,10 +15,7 @@ TERMS_LEFT = [
     (
         "Revisión, validación y aceptación",
         [
-            "Todas las facturas serán sometidas a un proceso interno de revisión para confirmar que:",
-            "a) coincidan los montos con esta Orden de Compra,",
-            "b) los servicios hayan sido entregados en tiempo y forma,",
-            "c) no existan discrepancias en precios, unidades o alcance.",
+            "Todas las facturas serán sometidas a un proceso interno de revisión para confirmar que coincidan los montos con esta Orden de Compra, que los servicios hayan sido entregados en tiempo y forma y que no existan discrepancias en precios, unidades o alcance.",
             "Si se requiere alguna aclaración o corrección, el área administrativa notificará al proveedor.",
         ],
     ),
@@ -32,7 +30,7 @@ TERMS_LEFT = [
         "Condiciones de servicio",
         [
             "El proveedor se compromete a entregar la totalidad de los servicios descritos en esta ODC conforme a los estándares de calidad acordados, manteniendo comunicación oportuna con el consultor responsable.",
-            "En caso de que existan entregables o evidencias asociadas (como bases de reclutamiento, grabaciones, comprobantes, materiales, etc.), estos deberán ser proporcionados antes de la emisión de la factura.",
+            "En caso de que existan entregables o evidencias asociadas, como bases de reclutamiento, grabaciones, comprobantes o materiales, estos deberán ser proporcionados antes de la emisión de la factura.",
         ],
     ),
     (
@@ -66,7 +64,7 @@ TERMS_LEFT = [
     (
         "Comunicación y soporte",
         [
-            "Para dudas, aclaraciones o seguimiento de pagos, el proveedor deberá comunicarse exclusivamente al correo: admin@sapience.com.mx",
+            "Para dudas, aclaraciones o seguimiento de pagos, el proveedor deberá comunicarse exclusivamente al correo admin@sapience.com.mx.",
             "Los consultores del proyecto no podrán autorizar pagos, modificaciones de alcance ni ajustes de tarifas.",
         ],
     ),
@@ -111,3 +109,5 @@ TERMS_LEFT = [
     ),
 ]
 
+# Mantener por compatibilidad con el main (1 columna)
+TERMS_RIGHT = []
